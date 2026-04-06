@@ -1,0 +1,317 @@
+"""
+Ingestion Pipeline — Entry Point
+──────────────────────────────────
+Ingest your website content without downloading anything.
+Just provide URLs — PDFs and videos are streamed directly.
+
+Usage examples:
+
+  # Provide a file of PDF URLs (one per line)
+  python pipeline.py --pdf-urls pdf_links.txt
+
+  # Provide a file of video URLs (one per line)
+  python pipeline.py --video-urls video_links.txt
+
+  # Scrape HTML pages
+  python pipeline.py --urls page_urls.txt
+
+  # Everything at once
+  python pipeline.py --pdf-urls pdf_links.txt --video-urls video_links.txt --urls page_urls.txt
+
+  # Local files still work too
+  python pipeline.py --pdfs ./docs --videos ./videos
+
+  # Test without Celery (slower, no queue needed)
+  python pipeline.py --pdf-urls pdf_links.txt --sync
+"""
+
+import argparse
+import sys
+from pathlib import Path
+from loguru import logger
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="RAG Ingestion Pipeline")
+
+    # Auto-crawl (no URL lists needed)
+    parser.add_argument("--crawl",   help="Auto-crawl entire site from this URL (e.g. https://yoursite.com)")
+    parser.add_argument("--sitemap", help="Use sitemap.xml to discover all URLs (faster than --crawl)")
+    parser.add_argument("--max-pages", type=int, default=1000, help="Max pages to crawl (default: 1000)")
+    parser.add_argument("--crawl-delay", type=float, default=0.5, help="Seconds between requests (default: 0.5)")
+
+    # URL-based inputs (no downloading needed)
+    parser.add_argument("--pdf-urls",   help="Text file with PDF URLs, one per line")
+    parser.add_argument("--video-urls", help="Text file with video URLs, one per line")
+    parser.add_argument("--urls",       help="Text file with HTML page URLs, one per line")
+
+    # Local file inputs (optional)
+    parser.add_argument("--pdfs",   help="Directory of local PDF files")
+    parser.add_argument("--videos", help="Directory of local video files")
+
+    parser.add_argument("--sync",   action="store_true",
+                        help="Run synchronously without Celery (good for testing)")
+    parser.add_argument("--whisper-model", default="base",
+                        choices=["tiny", "base", "small", "medium", "large"],
+                        help="Whisper model size for video transcription (default: base)")
+    return parser.parse_args()
+
+
+def run_pipeline(args):
+    jobs = 0
+
+    if args.crawl:
+        jobs += ingest_by_crawl(args.crawl, max_pages=args.max_pages,
+                                delay=args.crawl_delay, sync=args.sync,
+                                whisper_model=args.whisper_model)
+
+    if args.sitemap:
+        jobs += ingest_by_sitemap(args.sitemap, sync=args.sync,
+                                  whisper_model=args.whisper_model)
+
+    if args.pdf_urls:
+        jobs += ingest_pdf_urls(args.pdf_urls, sync=args.sync)
+
+    if args.pdfs:
+        jobs += ingest_pdf_directory(args.pdfs, sync=args.sync)
+
+    if args.urls:
+        jobs += ingest_html_urls(args.urls, sync=args.sync)
+
+    if args.video_urls:
+        jobs += ingest_video_urls(args.video_urls, args.whisper_model, sync=args.sync)
+
+    if args.videos:
+        jobs += ingest_video_directory(args.videos, args.whisper_model, sync=args.sync)
+
+    if jobs == 0:
+        logger.warning("Nothing to ingest! Use --pdf-urls, --video-urls, or --urls.")
+        sys.exit(1)
+
+    if not args.sync:
+        logger.info(f"\n{jobs} jobs queued. Monitor at: http://localhost:5555 (Flower)")
+    else:
+        logger.success(f"\nDone. {jobs} items processed.")
+
+
+def ingest_by_crawl(
+    start_url: str,
+    max_pages: int = 1000,
+    delay: float = 0.5,
+    sync: bool = False,
+    whisper_model: str = "base",
+) -> int:
+    """Discover URLs by crawling, then ingest each discovered type."""
+    from Extractors.crawler import crawl_site
+
+    urls = crawl_site(start_url, max_pages=max_pages, delay=delay)
+    return _ingest_discovered_urls(urls, sync=sync, whisper_model=whisper_model)
+
+
+def ingest_by_sitemap(
+    base_url: str,
+    sync: bool = False,
+    whisper_model: str = "base",
+) -> int:
+    """Discover URLs from sitemap.xml, then ingest each discovered type."""
+    from Extractors.crawler import crawl_sitemap
+
+    urls = crawl_sitemap(base_url)
+    return _ingest_discovered_urls(urls, sync=sync, whisper_model=whisper_model)
+
+
+# ── URL-based ingestion ───────────────────────────────────────────────────────
+
+def ingest_pdf_urls(urls_file: str, sync: bool = False) -> int:
+    urls = _read_lines(urls_file)
+    logger.info(f"Ingesting {len(urls)} PDF URLs from {urls_file}")
+    for url in urls:
+        if sync:
+            _sync_pdf(url)
+        else:
+            from worker import ingest_pdf
+            ingest_pdf.delay(url)   # worker handles both paths and URLs
+            logger.info(f"  Queued: {url}")
+    return len(urls)
+
+
+def ingest_video_urls(urls_file: str, model_size: str = "base", sync: bool = False) -> int:
+    urls = _read_lines(urls_file)
+    logger.info(f"Ingesting {len(urls)} video URLs from {urls_file}")
+    for url in urls:
+        if sync:
+            _sync_video(url, model_size)
+        else:
+            from worker import ingest_video
+            ingest_video.delay(url, is_url=True, model_size=model_size)
+            logger.info(f"  Queued: {url}")
+    return len(urls)
+
+
+def ingest_html_urls(urls_file: str, sync: bool = False) -> int:
+    urls = _read_lines(urls_file)
+    logger.info(f"Ingesting {len(urls)} HTML page URLs from {urls_file}")
+    for url in urls:
+        if sync:
+            _sync_html(url)
+        else:
+            from worker import ingest_url
+            ingest_url.delay(url)
+            logger.info(f"  Queued: {url}")
+    return len(urls)
+
+
+# ── Local directory ingestion ─────────────────────────────────────────────────
+
+def ingest_pdf_directory(directory: str, sync: bool = False) -> int:
+    files = list(Path(directory).rglob("*.pdf"))
+    logger.info(f"Found {len(files)} PDFs in {directory}")
+    for f in files:
+        if sync:
+            _sync_pdf(str(f))
+        else:
+            from worker import ingest_pdf
+            ingest_pdf.delay(str(f))
+            logger.info(f"  Queued: {f.name}")
+    return len(files)
+
+
+def ingest_video_directory(directory: str, model_size: str = "base", sync: bool = False) -> int:
+    extensions = {".mp4", ".mp3", ".wav", ".m4a", ".webm", ".ogg"}
+    files = [f for f in Path(directory).rglob("*") if f.suffix.lower() in extensions]
+    logger.info(f"Found {len(files)} video files in {directory}")
+    for f in files:
+        if sync:
+            _sync_video(str(f), model_size)
+        else:
+            from worker import ingest_video
+            ingest_video.delay(str(f), is_url=False, model_size=model_size)
+            logger.info(f"  Queued: {f.name}")
+    return len(files)
+
+
+def _ingest_discovered_urls(urls: list[str], sync: bool = False, whisper_model: str = "base") -> int:
+    from Extractors.crawler import MEDIA_EXTENSIONS
+
+    pdf_urls = [u for u in urls if u.lower().endswith(".pdf")]
+    video_urls = [u for u in urls if u.lower().endswith((".mp4", ".mp3", ".wav", ".m4a", ".webm", ".ogg"))]
+    html_urls = [u for u in urls if _extension_from_url(u) not in MEDIA_EXTENSIONS]
+
+    jobs = 0
+    logger.info(
+        f"Discovered URLs from crawl/sitemap: {len(html_urls)} HTML, {len(pdf_urls)} PDFs, {len(video_urls)} videos"
+    )
+
+    for url in html_urls:
+        if sync:
+            _sync_html(url)
+        else:
+            from worker import ingest_url
+            ingest_url.delay(url)
+            logger.info(f"  Queued HTML: {url}")
+        jobs += 1
+
+    for url in pdf_urls:
+        if sync:
+            _sync_pdf(url)
+        else:
+            from worker import ingest_pdf
+            ingest_pdf.delay(url)
+            logger.info(f"  Queued PDF: {url}")
+        jobs += 1
+
+    for url in video_urls:
+        if sync:
+            _sync_video(url, whisper_model)
+        else:
+            from worker import ingest_video
+            ingest_video.delay(url, is_url=True, model_size=whisper_model)
+            logger.info(f"  Queued video: {url}")
+        jobs += 1
+
+    return jobs
+
+
+# ── Sync (no Celery) helpers ──────────────────────────────────────────────────
+
+def _sync_pdf(source: str):
+    from Extractors.pdf_extractor import extract_pdf
+    from utils.chunker import chunk_pages
+    from utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    import os
+
+    pages = extract_pdf(source)  # handles URLs automatically
+    chunks = chunk_pages(pages)
+    embedded = embed_chunks(
+        chunks,
+        api_key=os.getenv("GEMINI_API_KEY"),
+        model=os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"),
+    )
+    client = init_collection()
+    upsert_embeddings(embedded, client)
+
+
+def _sync_html(url: str):
+    from Extractors.html_scraper import scrape_url
+    from utils.chunker import chunk_text
+    from utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    import os
+
+    page = scrape_url(url)
+    if not page:
+        return
+    chunks = chunk_text(page.text, source=url, metadata=page.metadata)
+    embedded = embed_chunks(
+        chunks,
+        api_key=os.getenv("GEMINI_API_KEY"),
+        model=os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"),
+    )
+    client = init_collection()
+    upsert_embeddings(embedded, client)
+
+
+def _sync_video(source: str, model_size: str = "base"):
+    from Extractors.video_transcriber import transcribe_file, transcribe_url
+    from utils.chunker import chunk_text
+    from utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    import os
+
+    if source.startswith("http://") or source.startswith("https://"):
+        result = transcribe_url(source, model_size)
+    else:
+        result = transcribe_file(source, model_size)
+
+    if not result:
+        return
+    chunks = chunk_text(result.transcript, source=source, metadata=result.metadata)
+    embedded = embed_chunks(
+        chunks,
+        api_key=os.getenv("GEMINI_API_KEY"),
+        model=os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"),
+    )
+    client = init_collection()
+    upsert_embeddings(embedded, client)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _read_lines(path: str) -> list[str]:
+    """Read a text file, skipping blank lines and # comments."""
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
+def _extension_from_url(url: str) -> str:
+    from urllib.parse import urlparse
+
+    path = urlparse(url).path.lower()
+    dot = path.rfind(".")
+    return path[dot:] if dot != -1 else ""
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_pipeline(args)

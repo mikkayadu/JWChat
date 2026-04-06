@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Book Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Fraunces:opsz,wght@9..144,600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-1: #f9f6f1;
+      --bg-2: #f1ebe2;
+      --panel: #fffdf9;
+      --ink: #1d1a17;
+      --muted: #5f5a52;
+      --brand: #0b6e4f;
+      --brand-soft: #d7f2e8;
+      --line: #e6ded2;
+      --radius: 16px;
+      --shadow: 0 14px 40px rgba(68, 53, 31, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Space Grotesk", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 420px at -10% -20%, #ffdba8 0%, transparent 55%),
+        radial-gradient(900px 380px at 110% 0%, #bfead6 0%, transparent 45%),
+        linear-gradient(150deg, var(--bg-1), var(--bg-2));
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    .chat-shell {
+      width: min(980px, 100%);
+      height: min(85vh, 860px);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      overflow: hidden;
+      animation: rise 500ms ease-out;
+    }
+
+    @keyframes rise {
+      from { transform: translateY(14px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+
+    header {
+      padding: 20px 22px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(90deg, #fff8eb, #eefaf4);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .title {
+      font-family: "Fraunces", serif;
+      font-size: clamp(1.2rem, 2.3vw, 1.8rem);
+      margin: 0;
+      letter-spacing: -0.01em;
+    }
+
+    .status {
+      font-size: 0.86rem;
+      color: var(--muted);
+      background: #fff;
+      border: 1px solid var(--line);
+      padding: 6px 10px;
+      border-radius: 999px;
+    }
+
+    .messages {
+      padding: 20px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .msg {
+      max-width: 85%;
+      padding: 12px 14px;
+      border-radius: var(--radius);
+      line-height: 1.45;
+      animation: fadeIn 200ms ease-out;
+      white-space: pre-wrap;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .msg.user {
+      align-self: flex-end;
+      background: #1f6f5f;
+      color: #f8fffc;
+      border-bottom-right-radius: 6px;
+    }
+
+    .msg.bot {
+      align-self: flex-start;
+      background: #fef8ee;
+      border: 1px solid #f0e2ce;
+      border-bottom-left-radius: 6px;
+    }
+
+    .sources {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px dashed #dcc8aa;
+      font-size: 0.86rem;
+      color: #564f44;
+    }
+
+    .source-item + .source-item { margin-top: 8px; }
+
+    .composer {
+      border-top: 1px solid var(--line);
+      padding: 14px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      background: #fff;
+    }
+
+    textarea {
+      width: 100%;
+      resize: none;
+      border: 1px solid #d8cdbe;
+      border-radius: 12px;
+      background: #fff;
+      color: var(--ink);
+      padding: 12px;
+      font: inherit;
+      min-height: 52px;
+      max-height: 180px;
+      outline: none;
+    }
+
+    textarea:focus { border-color: #1f6f5f; }
+
+    button {
+      border: none;
+      background: var(--brand);
+      color: white;
+      font-weight: 700;
+      padding: 0 18px;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: transform 120ms ease, filter 120ms ease;
+    }
+
+    button:hover { transform: translateY(-1px); filter: brightness(1.02); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    @media (max-width: 720px) {
+      .chat-shell { height: 92vh; border-radius: 18px; }
+      .msg { max-width: 94%; }
+      .composer { grid-template-columns: 1fr; }
+      button { height: 46px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="chat-shell">
+    <header>
+      <h1 class="title">Library Guide</h1>
+      <div id="status" class="status">Ready</div>
+    </header>
+
+    <section id="messages" class="messages" aria-live="polite"></section>
+
+    <form id="chat-form" class="composer">
+      <textarea id="question" placeholder="Ask about any book content indexed from your website..." required></textarea>
+      <button id="send-btn" type="submit">Send</button>
+    </form>
+  </main>
+
+  <script>
+    const messagesEl = document.getElementById("messages");
+    const form = document.getElementById("chat-form");
+    const input = document.getElementById("question");
+    const sendBtn = document.getElementById("send-btn");
+    const statusEl = document.getElementById("status");
+
+    function addMessage(text, role, sources = []) {
+      const box = document.createElement("article");
+      box.className = `msg ${role}`;
+      box.textContent = text;
+
+      if (role === "bot" && sources.length > 0) {
+        const s = document.createElement("div");
+        s.className = "sources";
+        s.innerHTML = sources.map((item, idx) => {
+          const score = Number(item.score || 0).toFixed(3);
+          return `<div class="source-item"><strong>[${idx + 1}]</strong> ${item.source} (score: ${score})<br>${item.snippet || ""}</div>`;
+        }).join("");
+        box.appendChild(s);
+      }
+
+      messagesEl.appendChild(box);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function setBusy(busy) {
+      sendBtn.disabled = busy;
+      input.disabled = busy;
+      statusEl.textContent = busy ? "Thinking..." : "Ready";
+    }
+
+    addMessage(
+      "Ask me anything about the books and pages already ingested. I will answer with citations.",
+      "bot"
+    );
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const question = input.value.trim();
+      if (!question) return;
+
+      addMessage(question, "user");
+      input.value = "";
+      setBusy(true);
+
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question, top_k: 5 })
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || "Request failed");
+        }
+
+        const data = await res.json();
+        addMessage(data.answer || "No answer returned.", "bot", data.sources || []);
+      } catch (err) {
+        addMessage(`Error: ${err.message}`, "bot");
+      } finally {
+        setBusy(false);
+        input.focus();
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+beautifulsoup4
+celery
+fastapi
+google-generativeai
+httpx
+loguru
+lxml
+openai-whisper
+pinecone
+playwright
+pydantic
+pymupdf
+python-dotenv
+pytesseract
+tiktoken
+uvicorn[standard]
+yt-dlp
