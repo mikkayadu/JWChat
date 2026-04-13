@@ -105,7 +105,7 @@ def ingest_by_crawl(
     whisper_model: str = "base",
 ) -> int:
     """Discover URLs by crawling, then ingest each discovered type."""
-    from Extractors.crawler import crawl_site
+    from ingestion.extractors.crawler import crawl_site
 
     urls = crawl_site(start_url, max_pages=max_pages, delay=delay)
     return _ingest_discovered_urls(urls, sync=sync, whisper_model=whisper_model)
@@ -117,7 +117,7 @@ def ingest_by_sitemap(
     whisper_model: str = "base",
 ) -> int:
     """Discover URLs from sitemap.xml, then ingest each discovered type."""
-    from Extractors.crawler import crawl_sitemap
+    from ingestion.extractors.crawler import crawl_sitemap
 
     urls = crawl_sitemap(base_url)
     return _ingest_discovered_urls(urls, sync=sync, whisper_model=whisper_model)
@@ -132,7 +132,7 @@ def ingest_pdf_urls(urls_file: str, sync: bool = False) -> int:
         if sync:
             _sync_pdf(url)
         else:
-            from worker import ingest_pdf
+            from ingestion.tasks.worker import ingest_pdf
             ingest_pdf.delay(url)   # worker handles both paths and URLs
             logger.info(f"  Queued: {url}")
     return len(urls)
@@ -145,7 +145,7 @@ def ingest_video_urls(urls_file: str, model_size: str = "base", sync: bool = Fal
         if sync:
             _sync_video(url, model_size)
         else:
-            from worker import ingest_video
+            from ingestion.tasks.worker import ingest_video
             ingest_video.delay(url, is_url=True, model_size=model_size)
             logger.info(f"  Queued: {url}")
     return len(urls)
@@ -158,7 +158,7 @@ def ingest_html_urls(urls_file: str, sync: bool = False) -> int:
         if sync:
             _sync_html(url)
         else:
-            from worker import ingest_url
+            from ingestion.tasks.worker import ingest_url
             ingest_url.delay(url)
             logger.info(f"  Queued: {url}")
     return len(urls)
@@ -173,7 +173,7 @@ def ingest_pdf_directory(directory: str, sync: bool = False) -> int:
         if sync:
             _sync_pdf(str(f))
         else:
-            from worker import ingest_pdf
+            from ingestion.tasks.worker import ingest_pdf
             ingest_pdf.delay(str(f))
             logger.info(f"  Queued: {f.name}")
     return len(files)
@@ -187,14 +187,14 @@ def ingest_video_directory(directory: str, model_size: str = "base", sync: bool 
         if sync:
             _sync_video(str(f), model_size)
         else:
-            from worker import ingest_video
+            from ingestion.tasks.worker import ingest_video
             ingest_video.delay(str(f), is_url=False, model_size=model_size)
             logger.info(f"  Queued: {f.name}")
     return len(files)
 
 
 def _ingest_discovered_urls(urls: list[str], sync: bool = False, whisper_model: str = "base") -> int:
-    from Extractors.crawler import MEDIA_EXTENSIONS
+    from ingestion.extractors.crawler import MEDIA_EXTENSIONS
 
     pdf_urls = [u for u in urls if u.lower().endswith(".pdf")]
     video_urls = [u for u in urls if u.lower().endswith((".mp4", ".mp3", ".wav", ".m4a", ".webm", ".ogg"))]
@@ -209,7 +209,7 @@ def _ingest_discovered_urls(urls: list[str], sync: bool = False, whisper_model: 
         if sync:
             _sync_html(url)
         else:
-            from worker import ingest_url
+            from ingestion.tasks.worker import ingest_url
             ingest_url.delay(url)
             logger.info(f"  Queued HTML: {url}")
         jobs += 1
@@ -218,7 +218,7 @@ def _ingest_discovered_urls(urls: list[str], sync: bool = False, whisper_model: 
         if sync:
             _sync_pdf(url)
         else:
-            from worker import ingest_pdf
+            from ingestion.tasks.worker import ingest_pdf
             ingest_pdf.delay(url)
             logger.info(f"  Queued PDF: {url}")
         jobs += 1
@@ -227,7 +227,7 @@ def _ingest_discovered_urls(urls: list[str], sync: bool = False, whisper_model: 
         if sync:
             _sync_video(url, whisper_model)
         else:
-            from worker import ingest_video
+            from ingestion.tasks.worker import ingest_video
             ingest_video.delay(url, is_url=True, model_size=whisper_model)
             logger.info(f"  Queued video: {url}")
         jobs += 1
@@ -238,9 +238,9 @@ def _ingest_discovered_urls(urls: list[str], sync: bool = False, whisper_model: 
 # ── Sync (no Celery) helpers ──────────────────────────────────────────────────
 
 def _sync_pdf(source: str):
-    from Extractors.pdf_extractor import extract_pdf
-    from utils.chunker import chunk_pages
-    from utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    from ingestion.extractors.pdf_extractor import extract_pdf
+    from ingestion.utils.chunker import chunk_pages
+    from ingestion.utils.embedder import embed_chunks, upsert_embeddings, init_collection
     import os
 
     pages = extract_pdf(source)  # handles URLs automatically
@@ -248,16 +248,16 @@ def _sync_pdf(source: str):
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"),
+        model=os.getenv("EMBEDDING_MODEL", "models/embedding-001"),
     )
     client = init_collection()
     upsert_embeddings(embedded, client)
 
 
 def _sync_html(url: str):
-    from Extractors.html_scraper import scrape_url
-    from utils.chunker import chunk_text
-    from utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    from ingestion.extractors.html_scraper import scrape_url
+    from ingestion.utils.chunker import chunk_text
+    from ingestion.utils.embedder import embed_chunks, upsert_embeddings, init_collection
     import os
 
     page = scrape_url(url)
@@ -267,16 +267,16 @@ def _sync_html(url: str):
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"),
+        model=os.getenv("EMBEDDING_MODEL", "models/embedding-001"),
     )
     client = init_collection()
     upsert_embeddings(embedded, client)
 
 
 def _sync_video(source: str, model_size: str = "base"):
-    from Extractors.video_transcriber import transcribe_file, transcribe_url
-    from utils.chunker import chunk_text
-    from utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    from ingestion.extractors.video_transcriber import transcribe_file, transcribe_url
+    from ingestion.utils.chunker import chunk_text
+    from ingestion.utils.embedder import embed_chunks, upsert_embeddings, init_collection
     import os
 
     if source.startswith("http://") or source.startswith("https://"):
@@ -290,7 +290,7 @@ def _sync_video(source: str, model_size: str = "base"):
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"),
+        model=os.getenv("EMBEDDING_MODEL", "models/embedding-001"),
     )
     client = init_collection()
     upsert_embeddings(embedded, client)

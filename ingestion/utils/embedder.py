@@ -9,13 +9,26 @@ import os
 import time
 import uuid
 from loguru import logger
-from utils.chunker import TextChunk
+from ingestion.utils.chunker import TextChunk
+
+
+def normalize_vector_dimensions(vector: list[float], target_dim: int) -> list[float]:
+    """Resize a vector to match the target dimension for Pinecone compatibility."""
+    if target_dim <= 0:
+        return vector
+
+    current_dim = len(vector)
+    if current_dim == target_dim:
+        return vector
+    if current_dim > target_dim:
+        return vector[:target_dim]
+    return vector + [0.0] * (target_dim - current_dim)
 
 
 def embed_chunks(
     chunks: list[TextChunk],
     api_key: str | None = None,
-    model: str = "models/text-embedding-004",
+    model: str = "models/embedding-001",
     batch_size: int = 100,
 ) -> list[dict]:
     """
@@ -33,6 +46,12 @@ def embed_chunks(
 
     genai.configure(api_key=resolved_key)
     results: list[dict] = []
+    resize_logged = False
+
+    try:
+        target_dim = int(os.getenv("EMBEDDING_DIMENSIONS", "0"))
+    except ValueError:
+        target_dim = 0
 
     logger.info(f"Embedding {len(chunks)} chunks in batches of {batch_size}...")
 
@@ -48,6 +67,13 @@ def embed_chunks(
                         task_type="retrieval_document",
                     )
                     vector = response["embedding"]
+                    if target_dim > 0 and len(vector) != target_dim:
+                        if not resize_logged:
+                            logger.warning(
+                                f"Resizing embedding vectors from {len(vector)} to {target_dim} to match configured index dimension"
+                            )
+                            resize_logged = True
+                        vector = normalize_vector_dimensions(vector, target_dim)
                     results.append({"chunk": chunk, "vector": vector})
                     success = True
                     break
