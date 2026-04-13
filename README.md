@@ -1,10 +1,19 @@
-# RAG Ingestion Pipeline
+# JWChat — Jehovah's Witnesses RAG Chatbot
 
-Ingests PDFs, HTML pages, and videos into a Qdrant vector database
-ready to power an AI chatbot.
+A RAG (Retrieval-Augmented Generation) chatbot for Jehovah's Witnesses content,
+ingesting PDFs, HTML pages, and videos into a **Pinecone** vector database
+and answering questions using **Gemini**.
 
 **You do NOT need to download any files.** Just provide URLs — the pipeline
 streams PDFs and videos directly from your website.
+
+## Features
+
+- **Multi-format ingestion**: PDFs (with OCR for scanned pages), HTML pages, and videos (YouTube/Vimeo/MP4)
+- **Automatic URL discovery**: Sitemap parsing and site crawling
+- **Parallel processing**: Celery + Redis for handling thousands of files
+- **Intent routing**: LangGraph-powered flow that handles greetings, off-topic questions, and domain-specific queries
+- **Source citations**: All answers include references to the source material
 
 ## Project Structure
 
@@ -16,22 +25,31 @@ JWChat/
 ├── page_urls.txt
 ├── pdf_links.txt
 ├── api/
-│   └── app.py
+│   ├── __init__.py
+│   ├── app.py                  # FastAPI backend
+│   └── services/
+│       ├── __init__.py
+│       └── chat_service.py     # LangGraph intent routing + RAG
 ├── static/
-│   └── index.html
+│   └── index.html              # Chat UI
 └── ingestion/
+  ├── __init__.py
   ├── cli/
-  │   └── pipeline.py
+  │   ├── __init__.py
+  │   └── pipeline.py           # CLI entry point
   ├── tasks/
-  │   └── worker.py
+  │   ├── __init__.py
+  │   └── worker.py             # Celery tasks
   ├── extractors/
-  │   ├── crawler.py
-  │   ├── html_scraper.py
-  │   ├── pdf_extractor.py
-  │   └── video_transcriber.py
+  │   ├── __init__.py           # Shared dataclasses
+  │   ├── crawler.py            # Site crawling + sitemap
+  │   ├── html_scraper.py       # HTML page extraction
+  │   ├── pdf_extractor.py      # PDF extraction (text + OCR)
+  │   └── video_transcriber.py  # Video transcription (Whisper)
   └── utils/
-    ├── chunker.py
-    └── embedder.py
+      ├── __init__.py
+      ├── chunker.py            # Token-aware text chunking
+      └── embedder.py           # Gemini embeddings + Pinecone
 ```
 
 ---
@@ -44,7 +62,7 @@ JWChat/
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-playwright install chromium
+playwright install chromium     # For JS-rendered page scraping
 ```
 
 ### 2. Configure environment
@@ -54,11 +72,11 @@ cp .env.example .env
 # Open .env and add your OPENAI_API_KEY
 ```
 
-### 3. Start Qdrant (vector database)
+### 3. Create Pinecone Index (if not exists)
 
-```bash
-docker run -p 6333:6333 qdrant/qdrant
-```
+The pipeline auto-creates the Pinecone index on first run. Ensure your `.env`
+has the correct `PINECONE_API_KEY`, `PINECONE_INDEX`, `PINECONE_CLOUD`, and
+`PINECONE_REGION` values.
 
 ### 4. Start Redis + Celery (for parallel processing of thousands of files)
 
@@ -155,7 +173,7 @@ python -m ingestion.cli.pipeline --videos ./my_videos
 
 - **Celery Flower** (task dashboard): `pip install flower && celery -A worker flower`
   Then open http://localhost:5555
-- **Qdrant dashboard**: http://localhost:6333/dashboard
+- **Pinecone console**: https://app.pinecone.io
 
 ---
 
@@ -166,7 +184,36 @@ so re-ingesting the same URL replaces old vectors rather than creating duplicate
 
 ---
 
-## Next step
+## Running the Chatbot
 
-Once ingestion is done, build the **Query API** — a FastAPI backend that accepts
-user questions, searches Qdrant, and calls Claude to generate answers.
+After ingestion is complete, start the API server:
+
+```bash
+uvicorn api.app:app --reload --host 0.0.0.0 --port 8000
+```
+
+Then open http://localhost:8000 in your browser to chat.
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Chat UI |
+| `/health` | GET | Health check |
+| `/api/chat` | POST | Send a question |
+
+### Example Chat Request
+
+```bash
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What does the Bible say about love?", "top_k": 5}'
+```
+
+### Intent Routing
+
+The chatbot uses LangGraph to classify queries:
+
+- **Greetings** → Friendly welcome message
+- **Off-topic** → Polite redirect to JW content
+- **In-domain** → RAG retrieval + Gemini answer with citations
