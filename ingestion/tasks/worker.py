@@ -39,7 +39,7 @@ app.conf.update(
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 def _get_vector_client():
-    from utils.embedder import init_collection
+    from ingestion.utils.embedder import init_collection
     return init_collection(
         collection_name=os.getenv("PINECONE_INDEX", "website-rag"),
         vector_size=int(os.getenv("EMBEDDING_DIMENSIONS", 768)),
@@ -47,7 +47,7 @@ def _get_vector_client():
 
 
 def _embed_and_store(chunks):
-    from utils.embedder import embed_chunks, upsert_embeddings
+    from ingestion.utils.embedder import embed_chunks, upsert_embeddings
 
     if not chunks:
         return 0
@@ -55,7 +55,7 @@ def _embed_and_store(chunks):
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"),
+        model=os.getenv("EMBEDDING_MODEL", "models/embedding-001"),
     )
     client = _get_vector_client()
     upsert_embeddings(embedded, client, os.getenv("PINECONE_INDEX", "website-rag"))
@@ -68,8 +68,8 @@ def _embed_and_store(chunks):
 def ingest_pdf(self, file_path: str):
     """Ingest a single PDF file."""
     try:
-        from Extractors.pdf_extractor import extract_pdf
-        from utils.chunker import chunk_pages
+        from ingestion.extractors.pdf_extractor import extract_pdf
+        from ingestion.utils.chunker import chunk_pages
 
         logger.info(f"[PDF] Starting: {file_path}")
         pages = extract_pdf(file_path)
@@ -91,8 +91,8 @@ def ingest_pdf(self, file_path: str):
 def ingest_url(self, url: str, use_playwright: bool = True):
     """Scrape and ingest a single HTML page."""
     try:
-        from Extractors.html_scraper import scrape_url
-        from utils.chunker import chunk_text
+        from ingestion.extractors.html_scraper import scrape_url
+        from ingestion.utils.chunker import chunk_text
 
         logger.info(f"[HTML] Starting: {url}")
         page = scrape_url(url, use_playwright=use_playwright)
@@ -119,15 +119,15 @@ def ingest_url(self, url: str, use_playwright: bool = True):
 def ingest_video(self, source: str, is_url: bool = False, model_size: str = "base"):
     """Transcribe and ingest a video file or URL."""
     try:
-        from utils.chunker import chunk_text
+        from ingestion.utils.chunker import chunk_text
 
         logger.info(f"[VIDEO] Starting: {source}")
 
         if is_url:
-            from Extractors.video_transcriber import transcribe_url
+            from ingestion.extractors.video_transcriber import transcribe_url
             result = transcribe_url(source, model_size=model_size)
         else:
-            from Extractors.video_transcriber import transcribe_file
+            from ingestion.extractors.video_transcriber import transcribe_file
             result = transcribe_file(source, model_size=model_size)
 
         if not result:

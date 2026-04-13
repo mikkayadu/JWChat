@@ -108,12 +108,19 @@ def _parse_html(html: str, url: str) -> ExtractedPage:
         tag.decompose()
 
     # Remove elements whose class/id suggests boilerplate
-    for tag in soup.find_all(True):
-        class_id = " ".join(tag.get("class", [])) + " " + (tag.get("id") or "")
+    # Iterate over a snapshot because decomposing nodes mutates the tree.
+    for tag in list(soup.find_all(True)):
+        if getattr(tag, "attrs", None) is None:
+            continue
+
+        classes = tag.get("class") or []
+        if isinstance(classes, str):
+            classes = [classes]
+        class_id = " ".join(classes) + " " + (tag.get("id") or "")
         if _NOISE_PATTERNS.search(class_id):
             tag.decompose()
 
-    title = soup.title.string.strip() if soup.title else url
+    title = soup.title.get_text(strip=True) if soup.title else url
 
     # Prefer <main> or <article> if present, otherwise whole body
     content_tag = soup.find("main") or soup.find("article") or soup.body or soup
