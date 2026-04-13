@@ -1,6 +1,6 @@
 """
 PDF Ingestion
-─────────────
+────────────
 Handles both text-based and scanned (OCR) PDFs.
 Accepts local file paths OR remote URLs — no downloading needed.
 Uses PyMuPDF for fast text extraction, falls back to
@@ -11,16 +11,8 @@ import io
 import fitz  # PyMuPDF
 from pathlib import Path
 from loguru import logger
-from dataclasses import dataclass, field
 
-
-@dataclass
-class ExtractedPage:
-    page_number: int
-    text: str
-    source_path: str
-    is_ocr: bool = False
-    metadata: dict = field(default_factory=dict)
+from ingestion.extractors import ExtractedPage
 
 
 def extract_pdf_from_url(url: str) -> list[ExtractedPage]:

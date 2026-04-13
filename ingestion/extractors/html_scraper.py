@@ -1,6 +1,6 @@
 """
 HTML Ingestion
-──────────────
+─────────────
 Scrapes public web pages using Playwright (handles JS-rendered pages)
 with a BeautifulSoup fallback for simple static pages.
 
@@ -8,17 +8,9 @@ Strips navigation, footers, ads and other boilerplate automatically.
 """
 
 import re
-from dataclasses import dataclass, field
 from loguru import logger
 
-
-@dataclass
-class ExtractedPage:
-    url: str
-    title: str
-    text: str
-    source_path: str = ""
-    metadata: dict = field(default_factory=dict)
+from ingestion.extractors import ExtractedPage
 
 
 # HTML tags whose content we always discard
