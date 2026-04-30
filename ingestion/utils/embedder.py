@@ -6,6 +6,7 @@ Embedder + Vector Store
 """
 
 import os
+import unicodedata
 import time
 import uuid
 import re
@@ -34,6 +35,25 @@ def _is_low_quality_error_chunk(text: str) -> bool:
 
     word_count = len(re.findall(r"\b\w+\b", normalized))
     return word_count < 12
+
+
+def _normalize_metadata_text(text: str) -> str:
+    if not text:
+        return ""
+
+    normalized = (
+        text.replace("“", "\"")
+        .replace("”", "\"")
+        .replace("‘", "'")
+        .replace("’", "'")
+        .replace("—", "-")
+        .replace("–", "-")
+        .replace("\u200b", "")
+        .replace("\ufeff", "")
+    )
+
+    normalized = unicodedata.normalize("NFKC", normalized)
+    return normalized.encode("latin-1", "ignore").decode("latin-1")
 
 
 def normalize_vector_dimensions(vector: list[float], target_dim: int) -> list[float]:
@@ -197,7 +217,7 @@ def upsert_embeddings(
             ))
 
             metadata = {
-                "text": chunk.text,
+                "text": _normalize_metadata_text(chunk.text),
                 "source": chunk.source,
                 **chunk.metadata,
             }
