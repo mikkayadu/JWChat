@@ -7,6 +7,9 @@ with a BeautifulSoup fallback for simple static pages.
 Strips navigation, footers, ads and other boilerplate automatically.
 """
 
+import os
+from pathlib import Path
+from urllib.parse import urlparse
 import re
 from loguru import logger
 
@@ -41,10 +44,29 @@ _ERROR_TEXT_MARKERS = [
     "verify you are human",
     "captcha",
     "temporarily unavailable",
+    "cookies and similar technologies",
+    "privacy settings",
 ]
 
 _MIN_TEXT_CHARS = 180
 _MIN_WORD_COUNT = 30
+
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
+)
+_DEFAULT_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+_DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+
+_CONTENT_SELECTORS = [
+    "article#article",
+    "article.jwac",
+    "main",
+    "article",
+    "[itemprop='articleBody']",
+    "[role='main']",
+]
 
 
 def scrape_url(url: str, use_playwright: bool = True) -> ExtractedPage | None:
@@ -82,16 +104,29 @@ def _fetch_with_playwright(url: str) -> tuple[str, int | None] | None:
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+            context = _create_browser_context(browser)
+            _apply_site_cookies(context, url)
+            page = context.new_page()
 
             # Block images, fonts, media — speeds up scraping
             page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,mp4,mp3}", lambda r: r.abort())
 
-            response = page.goto(url, wait_until="networkidle", timeout=30_000)
+            response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            _handle_consent_dialog(page)
+            _wait_for_content(page)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                pass
             html = page.content()
+            _maybe_dump_html(url, html, stage="after-consent")
             status_code = response.status if response else None
+            context.close()
             browser.close()
             logger.debug(f"Playwright fetched: {url}")
+            if _is_blocked_response(html=html, status_code=status_code):
+                logger.warning(f"Playwright blocked for {url} (status={status_code}) — trying httpx")
+                return _fetch_with_httpx(url)
             return html, status_code
     except Exception as e:
         logger.warning(f"Playwright failed for {url}: {e} — trying httpx")
@@ -102,8 +137,9 @@ def _fetch_with_httpx(url: str) -> tuple[str, int | None] | None:
     """Lightweight fallback for static pages."""
     try:
         import httpx
+        headers = _build_default_headers()
         resp = httpx.get(url, timeout=15, follow_redirects=True,
-                         headers={"User-Agent": "RAG-Bot/1.0 (+https://yoursite.com/bot)"})
+                         headers=headers)
         resp.raise_for_status()
         return resp.text, resp.status_code
     except Exception as e:
@@ -127,6 +163,9 @@ def _parse_html(html: str, url: str, status_code: int | None = None) -> Extracte
         if getattr(tag, "attrs", None) is None:
             continue
 
+        if _is_primary_content_tag(tag):
+            continue
+
         classes = tag.get("class") or []
         if isinstance(classes, str):
             classes = [classes]
@@ -136,8 +175,15 @@ def _parse_html(html: str, url: str, status_code: int | None = None) -> Extracte
 
     title = soup.title.get_text(strip=True) if soup.title else url
 
-    # Prefer <main> or <article> if present, otherwise whole body
-    content_tag = soup.find("main") or soup.find("article") or soup.body or soup
+    # Prefer article content if present, otherwise fall back to main/body
+    content_tag = (
+        soup.select_one("article#article")
+        or soup.select_one("article.jwac")
+        or soup.find("main")
+        or soup.find("article")
+        or soup.body
+        or soup
+    )
 
     # Get text and clean whitespace
     lines = [line.strip() for line in content_tag.get_text(separator="\n").splitlines()]
@@ -179,7 +225,139 @@ def _should_skip_page(title: str, text: str, status_code: int | None) -> bool:
     if _ERROR_TITLE_PATTERNS.search(title_text) and word_count < 180:
         return True
 
-    if len(normalized_text) < _MIN_TEXT_CHARS or word_count < _MIN_WORD_COUNT:
+    if len(normalized_text) < _MIN_TEXT_CHARS and word_count < _MIN_WORD_COUNT:
         return True
 
     return False
+
+
+def _is_primary_content_tag(tag) -> bool:
+    if tag.name in {"article", "main"}:
+        return True
+
+    if tag.get("id") in {"article", "content"}:
+        return True
+
+    role = tag.get("role")
+    if role == "main":
+        return True
+
+    return False
+
+
+def _build_default_headers() -> dict[str, str]:
+    user_agent = os.getenv("SCRAPER_USER_AGENT", _DEFAULT_USER_AGENT)
+    accept = os.getenv("SCRAPER_ACCEPT", _DEFAULT_ACCEPT)
+    accept_language = os.getenv("SCRAPER_ACCEPT_LANGUAGE", _DEFAULT_ACCEPT_LANGUAGE)
+    return {
+        "User-Agent": user_agent,
+        "Accept": accept,
+        "Accept-Language": accept_language,
+    }
+
+
+def _create_browser_context(browser):
+    headers = _build_default_headers()
+    user_agent = headers.get("User-Agent")
+    locale = os.getenv("SCRAPER_LOCALE", "en-US")
+    proxy = os.getenv("SCRAPER_PROXY")
+
+    context_kwargs = {
+        "user_agent": user_agent,
+        "locale": locale,
+        "extra_http_headers": headers,
+    }
+    if proxy:
+        context_kwargs["proxy"] = {"server": proxy}
+
+    return browser.new_context(**context_kwargs)
+
+
+def _is_blocked_response(html: str, status_code: int | None) -> bool:
+    if status_code is not None and status_code >= 400:
+        return True
+
+    normalized = (html or "").lower()
+    sample = normalized[:8000]
+    return any(marker in sample for marker in _ERROR_TEXT_MARKERS)
+
+
+def _handle_consent_dialog(page) -> None:
+    """Best-effort cookie/consent handling for JS-rendered sites."""
+    import re as _re
+
+    try:
+        consent_button = page.locator("button.lnc-acceptCookiesButton")
+        if consent_button.count() > 0:
+            consent_button.first.click(timeout=2_000)
+            return
+    except Exception:
+        pass
+
+    button_patterns = [
+        r"accept all",
+        r"accept cookies",
+        r"accept",
+        r"i accept",
+        r"agree",
+        r"allow all",
+        r"ok",
+    ]
+
+    for pattern in button_patterns:
+        if _click_consent_button(page, pattern, _re):
+            return
+
+    for frame in page.frames:
+        for pattern in button_patterns:
+            if _click_consent_button(frame, pattern, _re):
+                return
+
+
+def _click_consent_button(target, pattern: str, re_module) -> bool:
+    try:
+        locator = target.get_by_role("button", name=re_module.compile(pattern, re_module.IGNORECASE))
+        if locator.count() > 0:
+            locator.first.click(timeout=2_000)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _wait_for_content(page) -> None:
+    for selector in _CONTENT_SELECTORS:
+        try:
+            page.wait_for_selector(selector, timeout=5_000)
+            return
+        except Exception:
+            continue
+
+
+def _maybe_dump_html(url: str, html: str, stage: str) -> None:
+    if os.getenv("SCRAPER_DEBUG_DUMP", "").lower() not in {"1", "true", "yes"}:
+        return
+
+    safe_name = re.sub(r"[^a-zA-Z0-9]+", "-", url).strip("-")[:120]
+    dump_dir = Path(".tmp") / "scraper-dumps"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    dump_path = dump_dir / f"{safe_name}-{stage}.html"
+    dump_path.write_text(html or "", encoding="utf-8")
+    logger.info(f"[HTML] Debug dump saved: {dump_path}")
+
+
+def _apply_site_cookies(context, url: str) -> None:
+    """Pre-seed consent cookies for known sites to reduce overlays."""
+    try:
+        hostname = urlparse(url).hostname or ""
+        if hostname.endswith("jw.org"):
+            context.add_cookies([
+                {
+                    "name": "cookieConsent-FUNCTIONAL",
+                    "value": "true",
+                    "domain": ".jw.org",
+                    "path": "/",
+                },
+            ])
+    except Exception:
+        return
