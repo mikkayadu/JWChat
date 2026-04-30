@@ -17,6 +17,7 @@ pydantic
 pymupdf
 python-dotenv
 pytesseract
+redis
 tiktoken
 uvicorn[standard]
 yt-dlp
