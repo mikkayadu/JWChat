@@ -13,6 +13,7 @@ Then submit jobs from pipeline.py or any Python script.
 from celery import Celery
 from loguru import logger
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,7 +32,9 @@ app.conf.update(
     accept_content=["json"],
     task_track_started=True,
     task_acks_late=True,           # re-queue if worker crashes mid-task
+    task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,  # don't grab too many tasks at once
+    broker_transport_options={"visibility_timeout": 3600},
     result_expires=3600,
 )
 
@@ -44,6 +47,29 @@ def _get_vector_client():
         collection_name=os.getenv("PINECONE_INDEX", "website-rag"),
         vector_size=int(os.getenv("EMBEDDING_DIMENSIONS", 768)),
     )
+
+
+def _get_redis_client():
+    import redis
+
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    return redis.Redis.from_url(redis_url, decode_responses=True)
+
+
+def _crawl_seen_key(job_id: str) -> str:
+    return f"crawl:{job_id}:seen"
+
+
+def _crawl_pages_key(job_id: str) -> str:
+    return f"crawl:{job_id}:pages"
+
+
+def _crawl_failed_key(job_id: str) -> str:
+    return f"crawl:{job_id}:failed"
+
+
+def _ttl_seconds() -> int:
+    return int(os.getenv("CRAWL_JOB_TTL_SECONDS", "86400"))
 
 
 def _embed_and_store(chunks):
@@ -60,6 +86,19 @@ def _embed_and_store(chunks):
     client = _get_vector_client()
     upsert_embeddings(embedded, client, os.getenv("PINECONE_INDEX", "website-rag"))
     return len(embedded)
+
+
+def _queue_media_ingestion(url: str):
+    lowered = url.lower()
+    if lowered.endswith(".pdf"):
+        ingest_pdf.delay(url)
+        return "pdf"
+
+    if lowered.endswith((".mp4", ".mp3", ".wav", ".m4a", ".webm", ".ogg")):
+        ingest_video.delay(url, is_url=True, model_size=os.getenv("WHISPER_MODEL", "base"))
+        return "video"
+
+    return "unknown"
 
 
 # ── Tasks ─────────────────────────────────────────────────────────────────────
@@ -97,7 +136,8 @@ def ingest_url(self, url: str, use_playwright: bool = True):
         logger.info(f"[HTML] Starting: {url}")
         page = scrape_url(url, use_playwright=use_playwright)
         if not page:
-            return {"url": url, "vectors": 0, "error": "scrape failed"}
+            logger.warning(f"[HTML] Skipped: {url} (scrape failed or page deemed non-content/error)")
+            return {"url": url, "vectors": 0, "error": "invalid_or_error_page"}
 
         chunks = chunk_text(
             page.text,
@@ -146,4 +186,119 @@ def ingest_video(self, source: str, is_url: bool = False, model_size: str = "bas
 
     except Exception as e:
         logger.error(f"[VIDEO] Failed: {source}: {e}")
+        raise self.retry(exc=e)
+
+
+@app.task(bind=True, max_retries=5, default_retry_delay=5)
+def crawl_and_enqueue(
+    self,
+    url: str,
+    job_id: str,
+    allowed_domain: str,
+    max_pages: int = 1000,
+    delay: float = 0.0,
+    include_subdomains: bool = False,
+    respect_robots: bool = True,
+    use_playwright: bool = True,
+):
+    """
+    Crawl one URL, queue ingestion for it, and fan out child crawl tasks.
+    URL dedupe is atomic via Redis SADD on crawl:{job_id}:seen.
+    """
+    try:
+        from urllib.parse import urlparse
+        from ingestion.extractors.crawler import (
+            MEDIA_EXTENSIONS,
+            SKIP_EXTENSIONS,
+            _extract_links,
+            _fetch,
+            _get_extension,
+            _is_disallowed,
+            _load_robots,
+            _normalise,
+        )
+
+        redis_client = _get_redis_client()
+        canonical_url = _normalise(url)
+        seen_key = _crawl_seen_key(job_id)
+        pages_key = _crawl_pages_key(job_id)
+        failed_key = _crawl_failed_key(job_id)
+        ttl_seconds = _ttl_seconds()
+
+        # Atomic dedupe gate: only first task for a URL proceeds.
+        is_new = redis_client.sadd(seen_key, canonical_url)
+        if is_new == 0:
+            return {"url": canonical_url, "status": "duplicate"}
+
+        redis_client.expire(seen_key, ttl_seconds)
+        redis_client.expire(pages_key, ttl_seconds)
+        redis_client.expire(failed_key, ttl_seconds)
+
+        ext = _get_extension(canonical_url)
+        if ext in MEDIA_EXTENSIONS:
+            media_type = _queue_media_ingestion(canonical_url)
+            logger.info(f"[CRAWL] Queued {media_type}: {canonical_url}")
+            return {"url": canonical_url, "status": "queued_media", "type": media_type}
+
+        if ext in SKIP_EXTENSIONS:
+            return {"url": canonical_url, "status": "skipped_extension"}
+
+        if respect_robots:
+            scheme = urlparse(canonical_url).scheme or "https"
+            base_url = f"{scheme}://{allowed_domain}"
+            disallowed = _load_robots(base_url)
+            if _is_disallowed(canonical_url, disallowed):
+                return {"url": canonical_url, "status": "blocked_by_robots"}
+
+        current_count = int(redis_client.get(pages_key) or 0)
+        if current_count >= max_pages:
+            return {"url": canonical_url, "status": "max_pages_reached", "pages": current_count}
+
+        if delay > 0:
+            time.sleep(delay)
+
+        html = _fetch(canonical_url)
+        if not html:
+            redis_client.incr(failed_key)
+            return {"url": canonical_url, "status": "fetch_failed"}
+
+        pages = redis_client.incr(pages_key)
+        if pages > max_pages:
+            return {"url": canonical_url, "status": "max_pages_reached", "pages": pages}
+
+        ingest_url.delay(canonical_url, use_playwright=use_playwright)
+
+        links = _extract_links(
+            html,
+            canonical_url,
+            allowed_domain,
+            include_subdomains,
+        )
+
+        queued_children = 0
+        for link in links:
+            crawl_and_enqueue.delay(
+                link,
+                job_id,
+                allowed_domain,
+                max_pages=max_pages,
+                delay=delay,
+                include_subdomains=include_subdomains,
+                respect_robots=respect_robots,
+                use_playwright=use_playwright,
+            )
+            queued_children += 1
+
+        logger.info(
+            f"[CRAWL] {canonical_url} | pages={pages}/{max_pages} | children_queued={queued_children}"
+        )
+        return {
+            "url": canonical_url,
+            "status": "queued",
+            "pages": pages,
+            "children_queued": queued_children,
+        }
+
+    except Exception as e:
+        logger.error(f"[CRAWL] Failed: {url}: {e}")
         raise self.retry(exc=e)
