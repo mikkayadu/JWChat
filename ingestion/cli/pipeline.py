@@ -27,7 +27,15 @@ Usage examples:
 
 import argparse
 import sys
+import uuid
 from pathlib import Path
+from urllib.parse import (
+    parse_qsl,
+    urlencode,
+    urldefrag,
+    urlparse,
+    urlunparse,
+)
 from loguru import logger
 from dotenv import load_dotenv
 
@@ -105,10 +113,39 @@ def ingest_by_crawl(
     whisper_model: str = "base",
 ) -> int:
     """Discover URLs by crawling, then ingest each discovered type."""
-    from ingestion.extractors.crawler import crawl_site
+    if sync:
+        from ingestion.extractors.crawler import crawl_site
 
-    urls = crawl_site(start_url, max_pages=max_pages, delay=delay)
-    return _ingest_discovered_urls(urls, sync=sync, whisper_model=whisper_model)
+        urls = crawl_site(start_url, max_pages=max_pages, delay=delay)
+        return _ingest_discovered_urls(urls, sync=sync, whisper_model=whisper_model)
+
+    from ingestion.tasks.worker import crawl_and_enqueue
+
+    parsed = urlparse(start_url)
+    allowed_domain = parsed.netloc
+    if not allowed_domain:
+        logger.error(f"Invalid --crawl URL: {start_url}")
+        return 0
+
+    job_id = f"crawl-{uuid.uuid4().hex[:12]}"
+    seed_url = _normalise_url(start_url)
+
+    crawl_and_enqueue.delay(
+        seed_url,
+        job_id,
+        allowed_domain,
+        max_pages=max_pages,
+        delay=delay,
+        include_subdomains=False,
+        respect_robots=True,
+        use_playwright=True,
+    )
+
+    logger.info(
+        f"Started async crawl job '{job_id}' from {seed_url} (max_pages={max_pages}, delay={delay}s)"
+    )
+    logger.info("Crawl dedupe key: crawl:{job_id}:seen (Redis set)")
+    return 1
 
 
 def ingest_by_sitemap(
@@ -262,6 +299,7 @@ def _sync_html(url: str):
 
     page = scrape_url(url)
     if not page:
+        logger.warning(f"[HTML][sync] Skipped: {url} (scrape failed or page deemed non-content/error)")
         return
     chunks = chunk_text(page.text, source=url, metadata=page.metadata)
     embedded = embed_chunks(
@@ -310,6 +348,35 @@ def _extension_from_url(url: str) -> str:
     path = urlparse(url).path.lower()
     dot = path.rfind(".")
     return path[dot:] if dot != -1 else ""
+
+
+def _normalise_url(url: str) -> str:
+    """Canonicalize URL for stable crawl deduplication."""
+    url, _ = urldefrag(url)
+    parsed = urlparse(url)
+
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+
+    # Drop default ports so canonical form is stable.
+    if (scheme == "http" and netloc.endswith(":80")) or (scheme == "https" and netloc.endswith(":443")):
+        netloc = netloc.rsplit(":", 1)[0]
+
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+
+    # Remove noisy tracking query params and sort remaining params.
+    query_params = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered.startswith("utm_") or lowered in {"gclid", "fbclid"}:
+            continue
+        query_params.append((key, value))
+    query_params.sort()
+    query = urlencode(query_params, doseq=True)
+
+    return urlunparse((scheme, netloc, path, "", query, ""))
 
 
 if __name__ == "__main__":
