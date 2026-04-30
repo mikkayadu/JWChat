@@ -29,7 +29,7 @@ Usage:
 import re
 import time
 from collections import deque
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urljoin, urlparse, urldefrag, parse_qsl, urlencode, urlunparse
 from loguru import logger
 
 
@@ -291,9 +291,32 @@ def _is_disallowed(url: str, disallowed: set[str]) -> bool:
 
 
 def _normalise(url: str) -> str:
-    """Remove fragments and trailing slashes for consistent deduplication."""
+    """Canonicalize URL for consistent deduplication across workers."""
     url, _ = urldefrag(url)
-    return url.rstrip("/") if url.count("/") > 2 else url
+    parsed = urlparse(url)
+
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+
+    # Drop default ports so canonical form is stable.
+    if (scheme == "http" and netloc.endswith(":80")) or (scheme == "https" and netloc.endswith(":443")):
+        netloc = netloc.rsplit(":", 1)[0]
+
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+
+    # Remove noisy tracking query params and sort remaining params.
+    query_params = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered.startswith("utm_") or lowered in {"gclid", "fbclid"}:
+            continue
+        query_params.append((key, value))
+    query_params.sort()
+    query = urlencode(query_params, doseq=True)
+
+    return urlunparse((scheme, netloc, path, "", query, ""))
 
 
 def _get_extension(url: str) -> str:

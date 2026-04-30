@@ -8,8 +8,32 @@ Embedder + Vector Store
 import os
 import time
 import uuid
+import re
 from loguru import logger
 from ingestion.utils.chunker import TextChunk
+
+
+_ERROR_TEXT_MARKERS = [
+    "error: the request could not be satisfied",
+    "cloudfront",
+    "access denied",
+    "forbidden",
+    "request blocked",
+    "verify you are human",
+    "captcha",
+]
+
+
+def _is_low_quality_error_chunk(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return True
+
+    if any(marker in normalized for marker in _ERROR_TEXT_MARKERS):
+        return True
+
+    word_count = len(re.findall(r"\b\w+\b", normalized))
+    return word_count < 12
 
 
 def normalize_vector_dimensions(vector: list[float], target_dim: int) -> list[float]:
@@ -144,10 +168,23 @@ def upsert_embeddings(
         logger.warning("No embedded chunks to upsert")
         return
 
-    logger.info(f"Upserting {len(embedded)} vectors into Pinecone...")
+    filtered_embedded = [
+        item for item in embedded
+        if not _is_low_quality_error_chunk(item["chunk"].text)
+    ]
+    skipped = len(embedded) - len(filtered_embedded)
 
-    for i in range(0, len(embedded), batch_size):
-        batch = embedded[i : i + batch_size]
+    if skipped > 0:
+        logger.warning(f"Skipped {skipped} low-quality/error chunks before upsert")
+
+    if not filtered_embedded:
+        logger.warning("No valid embedded chunks to upsert after quality filter")
+        return
+
+    logger.info(f"Upserting {len(filtered_embedded)} vectors into Pinecone...")
+
+    for i in range(0, len(filtered_embedded), batch_size):
+        batch = filtered_embedded[i : i + batch_size]
         vectors = []
 
         for item in batch:
@@ -170,4 +207,4 @@ def upsert_embeddings(
         client.upsert(vectors=vectors)
         logger.debug(f"Upserted batch {i // batch_size + 1} ({len(batch)} points)")
 
-    logger.success(f"Done: {len(embedded)} vectors in '{collection_name}'")
+    logger.success(f"Done: {len(filtered_embedded)} vectors in '{collection_name}'")
