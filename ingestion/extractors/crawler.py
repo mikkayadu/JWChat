@@ -196,10 +196,29 @@ def _fetch(url: str) -> str | None:
         ct = resp.headers.get("content-type", "")
         if "html" not in ct and "xml" not in ct:
             return None
-        return resp.text
+        return _decode_content(resp)
     except Exception as e:
         logger.debug(f"  Fetch failed: {url}: {e}")
         return None
+
+
+def _decode_content(resp) -> str:
+    """Decode response content handling various encodings."""
+    content = resp.content
+    # Try encoding from response headers first
+    encoding = resp.encoding or "utf-8"
+    try:
+        return content.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        pass
+    # Fallback: try common encodings
+    for enc in ["utf-8", "latin-1", "windows-1252", "iso-8859-1"]:
+        try:
+            return content.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    # Last resort: decode with errors replaced
+    return content.decode("utf-8", errors="replace")
 
 
 def _extract_links(
