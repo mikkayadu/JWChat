@@ -295,13 +295,17 @@ def _sync_html(url: str):
     from ingestion.extractors.html_scraper import scrape_url
     from ingestion.utils.chunker import chunk_text
     from ingestion.utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    from ingestion.utils.preprocessor import preprocess, enrich_chunks_with_context
     import os
 
     page = scrape_url(url)
     if not page:
         logger.warning(f"[HTML][sync] Skipped: {url} (scrape failed or page deemed non-content/error)")
         return
+
+    page = preprocess(page)
     chunks = chunk_text(page.text, source=url, metadata=page.metadata)
+    chunks = enrich_chunks_with_context(chunks, title=page.title or url, full_text=page.text)
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),

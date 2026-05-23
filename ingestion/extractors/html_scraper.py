@@ -141,10 +141,30 @@ def _fetch_with_httpx(url: str) -> tuple[str, int | None] | None:
         resp = httpx.get(url, timeout=15, follow_redirects=True,
                          headers=headers)
         resp.raise_for_status()
-        return resp.text, resp.status_code
+        # Handle encoding issues gracefully
+        return _decode_response_content(resp), resp.status_code
     except Exception as e:
         logger.error(f"Failed to fetch {url}: {e}")
         return None
+
+
+def _decode_response_content(resp) -> str:
+    """Decode response content handling various encodings."""
+    content = resp.content
+    # Try encoding from response headers first
+    encoding = resp.encoding or "utf-8"
+    try:
+        return content.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        pass
+    # Fallback: try common encodings
+    for enc in ["utf-8", "latin-1", "windows-1252", "iso-8859-1"]:
+        try:
+            return content.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    # Last resort: decode with errors ignored
+    return content.decode("utf-8", errors="replace")
 
 
 def _parse_html(html: str, url: str, status_code: int | None = None) -> ExtractedPage | None:
@@ -185,9 +205,8 @@ def _parse_html(html: str, url: str, status_code: int | None = None) -> Extracte
         or soup
     )
 
-    # Get text and clean whitespace
-    lines = [line.strip() for line in content_tag.get_text(separator="\n").splitlines()]
-    text = "\n".join(line for line in lines if line)
+    # Extract text while preserving heading hierarchy as Markdown
+    text = _extract_structured_text(content_tag)
 
     if _should_skip_page(title=title, text=text, status_code=status_code):
         logger.warning(
@@ -344,6 +363,30 @@ def _maybe_dump_html(url: str, html: str, stage: str) -> None:
     dump_path = dump_dir / f"{safe_name}-{stage}.html"
     dump_path.write_text(html or "", encoding="utf-8")
     logger.info(f"[HTML] Debug dump saved: {dump_path}")
+
+
+def _extract_structured_text(tag) -> str:
+    """
+    Extract text from a BeautifulSoup tag while converting HTML heading tags
+    (h1-h4) into Markdown markers (#, ##, ###, ####).
+
+    This preserves the document's section hierarchy so the chunker can use
+    headings as natural split boundaries, and the context enricher can label
+    each chunk with its nearest section heading.
+
+    Replaces headings directly on the tag (safe — the tag is discarded after
+    this call; it's never reused elsewhere in the scraper).
+    """
+    _HEADING_MAP = {"h1": "#", "h2": "##", "h3": "###", "h4": "####"}
+
+    for level, marker in _HEADING_MAP.items():
+        for heading in tag.find_all(level):
+            heading_text = heading.get_text(strip=True)
+            if heading_text:
+                heading.replace_with(f"\n\n{marker} {heading_text}\n\n")
+
+    lines = [ln.strip() for ln in tag.get_text(separator="\n").splitlines()]
+    return "\n".join(ln for ln in lines if ln)
 
 
 def _apply_site_cookies(context, url: str) -> None:

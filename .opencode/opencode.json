@@ -1,3 +1,28 @@
 {
-  "$schema": "https://opencode.ai/config.json"
+"$schema": "https://opencode.ai/config.json",
+"model": "opencode/hy3-preview-free",
+"agent": {
+"OpenAgent": {
+"model": "anthropic/claude-opus-4-6"
+},
+"OpenCoder": {
+"model": "anthropic/claude-opus-4-6"
+},
+"OpenTechnicalWriter": {
+"model": "opencode/deepseek-v4-flash-free"
+},
+"OpenCopywriter": {
+"model": "opencode/deepseek-v4-flash-free"
+},
+"OpenDataAnalyst": {
+"model": "opencode/deepseek-v4-flash-free"
+},
+"OpenRepoManager": {
+"model": "opencode/deepseek-v4-flash-free"
+},
+"OpenSystemBuilder": {
+"model": "opencode/deepseek-v4-flash-free"
 }
+}
+}
+

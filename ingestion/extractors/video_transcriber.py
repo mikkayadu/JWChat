@@ -91,6 +91,7 @@ def transcribe_url(url: str, model_size: str = "base") -> TranscribedVideo | Non
     Transcribe a video/audio from any URL — no manual downloading needed.
 
     Supports:
+      - JW.org hash-routed pages: https://www.jw.org/en/library/videos/#en/mediaitems/...
       - Direct links:  https://yoursite.com/video.mp4  (streamed, not saved)
       - YouTube:       https://youtube.com/watch?v=...
       - Vimeo:         https://vimeo.com/...
@@ -99,14 +100,49 @@ def transcribe_url(url: str, model_size: str = "base") -> TranscribedVideo | Non
     logger.info(f"Processing video URL: {url}")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # Direct media file? Stream it straight down (faster than yt-dlp)
+        # JW.org hash-routed pages: resolve via mediator API.
+        jworg = _resolve_jworg_url(url)
+        if jworg:
+            # Fast path: VTT is a ready-made professional transcript — no Whisper needed.
+            if jworg.get("vtt_url"):
+                transcript = _fetch_vtt_transcript(jworg["vtt_url"])
+                if transcript:
+                    logger.success(f"[JW.org] Transcript from VTT: {url} ({len(transcript)} chars)")
+                    return TranscribedVideo(
+                        source=url,
+                        title=jworg["title"] or _title_from_url(url),
+                        transcript=transcript,
+                        language=url.split("/")[3] if "//" in url else "en",
+                        duration_seconds=jworg["duration"],
+                        metadata={
+                            "source_url": url,
+                            "transcript_source": "vtt",
+                            "file_type": "video",
+                        },
+                    )
+
+            # Slow path: download smallest MP4 and run Whisper.
+            if jworg.get("mp4_url"):
+                logger.info(f"[JW.org] No VTT — downloading MP4 for Whisper: {jworg['mp4_url']}")
+                audio_path = _download_direct(jworg["mp4_url"], tmp_dir)
+                if audio_path:
+                    result = transcribe_file(audio_path, model_size)
+                    if result:
+                        result.source = url
+                        result.title = jworg["title"] or _title_from_url(url)
+                        result.metadata["source_url"] = url
+                    return result
+
+            logger.error(f"JW.org mediator returned no usable URL for: {url}")
+            return None
+
+        # Non-JW.org URLs: direct file or yt-dlp.
         if _is_direct_media_url(url):
             audio_path = _download_direct(url, tmp_dir)
             if not audio_path:
                 logger.info("Direct download failed, trying yt-dlp as fallback...")
                 audio_path = _download_via_ytdlp(url, tmp_dir)
         else:
-            # YouTube, Vimeo, etc — use yt-dlp
             audio_path = _download_via_ytdlp(url, tmp_dir)
 
         if not audio_path:
@@ -153,6 +189,110 @@ def transcribe_directory(
 
 
 # ── Internals ─────────────────────────────────────────────────────────────────
+
+def _resolve_jworg_url(url: str) -> dict | None:
+    """
+    Resolve a JW.org hash-routed video page via the public mediator API.
+
+    URL format:  https://www.jw.org/en/library/videos/#en/mediaitems/{cat}/{pub_id}
+    API format:  https://b.jw-cdn.org/apis/mediator/v1/media-items/E/{pub_id}?clientType=www
+
+    Returns {
+        "title":    video title,
+        "duration": seconds (float),
+        "vtt_url":  subtitle/transcript URL (preferred — already plain text),
+        "mp4_url":  lowest-quality MP4 URL (fallback for Whisper),
+    } or None.
+    """
+    import re
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if "jw.org" not in (parsed.netloc or ""):
+        return None
+
+    # Fragment: e.g. "en/mediaitems/LatestVideos/pub-mwbv_202605_1_VIDEO"
+    match = re.match(r"([a-z\-]+)/mediaitems/[^/]+/(.+)", parsed.fragment or "")
+    if not match:
+        return None
+
+    lang_slug, pub_id = match.group(1), match.group(2)
+    # Mediator API uses single uppercase letter: "en" → "E", "es" → "S", etc.
+    api_lang = lang_slug[:1].upper()
+
+    api_url = (
+        f"https://b.jw-cdn.org/apis/mediator/v1/media-items"
+        f"/{api_lang}/{pub_id}?clientType=www"
+    )
+    logger.debug(f"JW.org mediator API: {api_url}")
+
+    try:
+        import httpx
+
+        resp = httpx.get(api_url, timeout=15, follow_redirects=True,
+                         headers={"User-Agent": "RAG-Bot/1.0"})
+        resp.raise_for_status()
+        data = resp.json()
+
+        media_item = (data.get("media") or [{}])[0]
+        title    = media_item.get("title", "")
+        duration = float(media_item.get("duration", 0.0))
+        files    = media_item.get("files", [])
+
+        # VTT subtitles are already a professional transcript — prefer over Whisper.
+        # All quality variants share the same VTT, so grab from first file.
+        vtt_url = (files[0].get("subtitles") or {}).get("url") if files else None
+
+        # Smallest MP4 as Whisper fallback (only audio matters, not resolution).
+        mp4s = sorted(
+            [f for f in files if f.get("progressiveDownloadURL", "").endswith(".mp4")],
+            key=lambda f: f.get("filesize", float("inf")),
+        )
+        mp4_url = mp4s[0]["progressiveDownloadURL"] if mp4s else None
+
+        if vtt_url or mp4_url:
+            return {"title": title, "duration": duration, "vtt_url": vtt_url, "mp4_url": mp4_url}
+
+    except Exception as e:
+        logger.warning(f"JW.org mediator API failed for {pub_id}: {e}")
+
+    return None
+
+
+def _fetch_vtt_transcript(vtt_url: str) -> str | None:
+    """Download a WebVTT file and return its text content as a plain string."""
+    try:
+        import httpx
+        resp = httpx.get(vtt_url, timeout=15, follow_redirects=True,
+                         headers={"User-Agent": "RAG-Bot/1.0"})
+        resp.raise_for_status()
+        return _parse_vtt(resp.text)
+    except Exception as e:
+        logger.warning(f"VTT download failed ({vtt_url}): {e}")
+        return None
+
+
+def _parse_vtt(content: str) -> str:
+    """Extract plain dialogue text from a WebVTT subtitle file."""
+    import re
+
+    lines = []
+    for line in content.splitlines():
+        line = line.strip()
+        if (
+            not line
+            or line.startswith("WEBVTT")
+            or line.startswith("NOTE")
+            or re.match(r"^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*", line)
+            or re.match(r"^\d+$", line)          # bare cue number
+        ):
+            continue
+        line = re.sub(r"<[^>]+>", "", line)      # strip inline VTT tags
+        if line:
+            lines.append(line)
+
+    return " ".join(lines)
+
 
 def _is_direct_media_url(url: str) -> bool:
     """True if the URL is a direct link to a media file (not a platform page)."""

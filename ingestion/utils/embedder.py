@@ -97,6 +97,17 @@ def embed_chunks(
     except ValueError:
         target_dim = 0
 
+    # Filter low-quality chunks BEFORE calling the API — saves embedding cost
+    valid_chunks = [c for c in chunks if not _is_low_quality_error_chunk(c.text)]
+    skipped = len(chunks) - len(valid_chunks)
+    if skipped:
+        logger.warning(f"Pre-embed quality filter: skipped {skipped} low-quality chunks")
+    chunks = valid_chunks
+
+    if not chunks:
+        logger.warning("No valid chunks remain after quality filter")
+        return results
+
     logger.info(f"Embedding {len(chunks)} chunks in batches of {batch_size}...")
 
     for i in range(0, len(chunks), batch_size):
@@ -109,6 +120,7 @@ def embed_chunks(
                         model=model,
                         content=chunk.text,
                         task_type="retrieval_document",
+                        output_dimensionality=768,
                     )
                     vector = response["embedding"]
                     if target_dim > 0 and len(vector) != target_dim:

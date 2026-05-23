@@ -36,6 +36,13 @@ from loguru import logger
 # File extensions we want to capture (not browse into)
 MEDIA_EXTENSIONS = {".pdf", ".mp4", ".mp3", ".wav", ".m4a", ".webm", ".ogg"}
 
+# Hash-routed video platform URLs (fragment IS the video identity — never normalise these).
+_VIDEO_PAGE_PATTERNS = [
+    re.compile(r"jw\.org.+#.+mediaitems"),      # JW.org hash-routed video pages
+    re.compile(r"youtube\.com/watch|youtu\.be/[^?]"),  # YouTube
+    re.compile(r"vimeo\.com/\d+"),               # Vimeo
+]
+
 # Extensions to skip entirely (images, fonts, scripts, etc.)
 SKIP_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
@@ -221,6 +228,11 @@ def _decode_content(resp) -> str:
     return content.decode("utf-8", errors="replace")
 
 
+def _is_video_page_url(url: str) -> bool:
+    """True if url is a hash-routed video platform page (not a bare media file)."""
+    return any(p.search(url) for p in _VIDEO_PAGE_PATTERNS)
+
+
 def _extract_links(
     html: str,
     current_url: str,
@@ -235,13 +247,24 @@ def _extract_links(
 
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
-        if not href or href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
+        if not href or href.startswith("mailto:") or href.startswith("tel:"):
             continue
 
-        full_url = _normalise(urljoin(current_url, href))
+        full_url = urljoin(current_url, href)
+
+        if _is_video_page_url(full_url):
+            # Keep the fragment — it identifies which video this is.
+            # Skip the domain check: yt-dlp handles cross-domain platform URLs.
+            links.append(full_url)
+            continue
+
+        # Plain fragment anchors (same-page scroll) are useless after normalisation.
+        if href.startswith("#"):
+            continue
+
+        full_url = _normalise(full_url)
         parsed = urlparse(full_url)
 
-        # Stay on same domain (optionally allow subdomains)
         if include_subdomains:
             if not parsed.netloc.endswith(base_domain):
                 continue
@@ -282,8 +305,14 @@ def _get_sitemap_from_robots(base_url: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+_robots_cache: dict[str, set[str]] = {}
+
+
 def _load_robots(base_url: str) -> set[str]:
     """Parse robots.txt and return disallowed paths for all bots."""
+    if base_url in _robots_cache:
+        return _robots_cache[base_url]
+
     robots_text = _fetch(f"{base_url}/robots.txt")
     if not robots_text:
         return set()
@@ -301,6 +330,7 @@ def _load_robots(base_url: str) -> set[str]:
             if path:
                 disallowed.add(path)
 
+    _robots_cache[base_url] = disallowed
     return disallowed
 
 

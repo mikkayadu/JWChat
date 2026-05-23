@@ -132,6 +132,7 @@ def ingest_url(self, url: str, use_playwright: bool = True):
     try:
         from ingestion.extractors.html_scraper import scrape_url
         from ingestion.utils.chunker import chunk_text
+        from ingestion.utils.preprocessor import preprocess, enrich_chunks_with_context
 
         logger.info(f"[HTML] Starting: {url}")
         page = scrape_url(url, use_playwright=use_playwright)
@@ -139,6 +140,7 @@ def ingest_url(self, url: str, use_playwright: bool = True):
             logger.warning(f"[HTML] Skipped: {url} (scrape failed or page deemed non-content/error)")
             return {"url": url, "vectors": 0, "error": "invalid_or_error_page"}
 
+        page = preprocess(page)
         chunks = chunk_text(
             page.text,
             source=url,
@@ -146,6 +148,7 @@ def ingest_url(self, url: str, use_playwright: bool = True):
             chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
         )
+        chunks = enrich_chunks_with_context(chunks, title=page.title or url, full_text=page.text)
         count = _embed_and_store(chunks)
         logger.success(f"[HTML] Done: {url} → {count} vectors")
         return {"url": url, "vectors": count}
@@ -214,16 +217,31 @@ def crawl_and_enqueue(
             _fetch,
             _get_extension,
             _is_disallowed,
+            _is_video_page_url,
             _load_robots,
             _normalise,
         )
 
         redis_client = _get_redis_client()
-        canonical_url = _normalise(url)
         seen_key = _crawl_seen_key(job_id)
         pages_key = _crawl_pages_key(job_id)
         failed_key = _crawl_failed_key(job_id)
         ttl_seconds = _ttl_seconds()
+
+        # Video platform pages (e.g. JW.org hash-routed URLs) must be detected
+        # before _normalise strips their fragment — the fragment IS the video id.
+        if _is_video_page_url(url):
+            is_new = redis_client.sadd(seen_key, url)
+            if is_new == 0:
+                return {"url": url, "status": "duplicate"}
+            redis_client.expire(seen_key, ttl_seconds)
+            redis_client.expire(pages_key, ttl_seconds)
+            redis_client.expire(failed_key, ttl_seconds)
+            ingest_video.delay(url, is_url=True, model_size=os.getenv("WHISPER_MODEL", "base"))
+            logger.info(f"[CRAWL] Queued video page: {url}")
+            return {"url": url, "status": "queued_video_page", "type": "video"}
+
+        canonical_url = _normalise(url)
 
         # Atomic dedupe gate: only first task for a URL proceeds.
         is_new = redis_client.sadd(seen_key, canonical_url)
@@ -243,16 +261,16 @@ def crawl_and_enqueue(
         if ext in SKIP_EXTENSIONS:
             return {"url": canonical_url, "status": "skipped_extension"}
 
+        current_count = int(redis_client.get(pages_key) or 0)
+        if current_count >= max_pages:
+            return {"url": canonical_url, "status": "max_pages_reached", "pages": current_count}
+
         if respect_robots:
             scheme = urlparse(canonical_url).scheme or "https"
             base_url = f"{scheme}://{allowed_domain}"
             disallowed = _load_robots(base_url)
             if _is_disallowed(canonical_url, disallowed):
                 return {"url": canonical_url, "status": "blocked_by_robots"}
-
-        current_count = int(redis_client.get(pages_key) or 0)
-        if current_count >= max_pages:
-            return {"url": canonical_url, "status": "max_pages_reached", "pages": current_count}
 
         if delay > 0:
             time.sleep(delay)

@@ -199,3 +199,6 @@ pyrightconfig.json
 .opencode-test/
 .opencode-agents-version
 *.backup-*/
+.opencode/
+*.tmp
+.claude

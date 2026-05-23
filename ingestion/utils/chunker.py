@@ -1,18 +1,30 @@
 """
 Text Chunker
-────────────
+───────────
 Splits long text into overlapping chunks suitable for embedding.
-Uses tiktoken to count tokens accurately (not characters).
 
-Strategy:
-  1. Split on paragraph boundaries first (preserves context)
-  2. If a paragraph is still too big, split on sentences
-  3. Apply a sliding window with configurable overlap
+Supports multiple strategies:
+  1. Recursive - Respects document structure (paragraphs, sentences, words)
+  2. Semantic - Splits at topic boundaries using embeddings
+  3. Fixed - Original sliding window approach (backward compatible)
+
+Chunking Strategy Selection:
+  - Use 'recursive' for most documents (respects structure)
+  - Use 'semantic' for narrative content with topic shifts
+  - Use 'fixed' for simple text or backward compatibility
 """
 
 import re
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Literal
 from loguru import logger
+
+
+class ChunkingStrategy(str, Enum):
+    RECURSIVE = "recursive"
+    SEMANTIC = "semantic"
+    FIXED = "fixed"
 
 
 @dataclass
@@ -22,26 +34,31 @@ class TextChunk:
     token_count: int
     source: str          # file path or URL
     metadata: dict = field(default_factory=dict)
+    strategy: str = "fixed"  # Track which strategy created this chunk
 
 
 def chunk_text(
     text: str,
     source: str,
     metadata: dict | None = None,
-    chunk_size: int = 400,
-    chunk_overlap: int = 80,
+    chunk_size: int = 512,
+    chunk_overlap: int = 100,
     model: str = "text-embedding-3-small",
+    strategy: ChunkingStrategy | str = ChunkingStrategy.RECURSIVE,
+    separators: list[str] | None = None,
 ) -> list[TextChunk]:
     """
-    Split text into overlapping token-aware chunks.
+    Split text into overlapping chunks using the specified strategy.
 
     Args:
         text:          The raw text to chunk
         source:        Where this text came from (URL or file path)
         metadata:      Extra fields to attach to every chunk
-        chunk_size:    Max tokens per chunk
-        chunk_overlap: How many tokens to repeat between consecutive chunks
+        chunk_size:    Max tokens per chunk (default: 512)
+        chunk_overlap: How many tokens to repeat between consecutive chunks (default: 100)
         model:         Tokeniser model name (determines token counts)
+        strategy:      Chunking strategy: 'recursive', 'semantic', or 'fixed'
+        separators:     Custom separators for recursive chunking (optional)
 
     Returns:
         List of TextChunk objects ready for embedding
@@ -49,9 +66,18 @@ def chunk_text(
     if not text or not text.strip():
         return []
 
+    strategy = ChunkingStrategy(strategy) if isinstance(strategy, str) else strategy
+
+    # Get token encoder for accurate token counts (used by fixed strategy and metadata)
     enc = _get_encoder(model)
-    paragraphs = _split_paragraphs(text)
-    raw_chunks = _sliding_window(paragraphs, enc, chunk_size, chunk_overlap)
+
+    if strategy == ChunkingStrategy.RECURSIVE:
+        raw_chunks = _recursive_chunk(text, chunk_size, chunk_overlap, separators)
+    elif strategy == ChunkingStrategy.SEMANTIC:
+        raw_chunks = _semantic_chunk(text, chunk_size, chunk_overlap)
+    else:  # FIXED
+        paragraphs = _split_paragraphs(text)
+        raw_chunks = _sliding_window(paragraphs, enc, chunk_size, chunk_overlap)
 
     chunks = []
     for i, chunk_text in enumerate(raw_chunks):
@@ -67,21 +93,34 @@ def chunk_text(
                 "total_chunks": len(raw_chunks),  # will update below
                 "token_count": token_count,
                 "source": source,
-            }
+                "chunking_strategy": strategy.value,
+            },
+            strategy=strategy.value,
         ))
 
     # Now we know the real total, update it
     for c in chunks:
         c.metadata["total_chunks"] = len(chunks)
 
-    logger.debug(f"Chunked '{source}': {len(chunks)} chunks from {len(text)} chars")
+    logger.debug(f"Chunked '{source}' using {strategy.value}: {len(chunks)} chunks from {len(text)} chars")
     return chunks
 
 
-def chunk_pages(pages: list, chunk_size: int = 400, chunk_overlap: int = 80) -> list[TextChunk]:
+def chunk_pages(
+    pages: list,
+    chunk_size: int = 512,
+    chunk_overlap: int = 100,
+    strategy: ChunkingStrategy | str = ChunkingStrategy.RECURSIVE,
+) -> list[TextChunk]:
     """
     Convenience wrapper: chunk a list of ExtractedPage / TranscribedVideo objects.
     Each page becomes its own set of chunks (page boundaries are respected).
+
+    Args:
+        pages:          List of page objects (PDF, HTML, Video)
+        chunk_size:    Max tokens per chunk
+        chunk_overlap:  Overlap between chunks
+        strategy:      Chunking strategy to use
     """
     all_chunks: list[TextChunk] = []
 
@@ -95,8 +134,14 @@ def chunk_pages(pages: list, chunk_size: int = 400, chunk_overlap: int = 80) -> 
         if hasattr(page, "page_number"):
             metadata["page_number"] = page.page_number
 
-        chunks = chunk_text(text, source=source, metadata=metadata,
-                            chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        chunks = chunk_text(
+            text,
+            source=source,
+            metadata=metadata,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            strategy=strategy,
+        )
         all_chunks.extend(chunks)
 
     return all_chunks
@@ -198,6 +243,76 @@ def _hard_split(text: str, enc, chunk_size: int, chunk_overlap: int) -> list[str
         chunks.append(enc.decode(chunk_tokens))
         start += chunk_size - chunk_overlap
 
+    return chunks
+
+
+def _recursive_chunk(
+    text: str,
+    chunk_size: int = 512,
+    chunk_overlap: int = 100,
+    separators: list[str] | None = None,
+) -> list[str]:
+    """
+    Use LangChain's RecursiveCharacterTextSplitter for structure-aware chunking.
+    Respects document structure (paragraphs > sentences > words).
+
+    Uses tiktoken to measure chunk size in tokens (not characters) so that
+    chunk_size matches the embedding model's token budget accurately.
+    """
+    try:
+        try:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+        except ImportError:
+            from langchain.text_splitter import RecursiveCharacterTextSplitter
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+
+        splitter = RecursiveCharacterTextSplitter(
+            separators=separators or ["\n\n", "\n", ". ", " ", ""],
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=lambda text: len(enc.encode(text)),
+        )
+        return splitter.split_text(text)
+    except ImportError:
+        logger.warning("LangChain or tiktoken not installed. Falling back to fixed chunking.")
+        return _fallback_chunk(text, chunk_size, chunk_overlap)
+
+
+def _semantic_chunk(
+    text: str,
+    chunk_size: int = 512,
+    chunk_overlap: int = 100,
+) -> list[str]:
+    """
+    Semantic chunking: split at topic boundaries using embedding similarity.
+    More expensive but produces semantically coherent chunks.
+    """
+    try:
+        from langchain_experimental.text_splitter import SemanticChunker
+        from langchain.embeddings import OpenAIEmbeddings
+
+        # Use OpenAI embeddings for semantic splitting
+        embeddings = OpenAIEmbeddings()
+        splitter = SemanticChunker(
+            embeddings=embeddings,
+            buffer_size=1,  # Number of sentences to group
+        )
+        return splitter.split_text(text)
+    except ImportError:
+        logger.warning("langchain_experimental not installed. Falling back to recursive chunking.")
+        return _recursive_chunk(text, chunk_size, chunk_overlap)
+
+
+def _fallback_chunk(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+    """Simple character-based chunking as fallback."""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        start += chunk_size - chunk_overlap
     return chunks
 
 

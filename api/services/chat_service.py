@@ -1,5 +1,6 @@
 import os
-from typing import TypedDict
+from typing import TypedDict, List, Tuple, Optional
+from enum import Enum
 
 from ingestion.utils.embedder import normalize_vector_dimensions
 from langchain_core.documents import Document
@@ -10,6 +11,24 @@ from langgraph.graph import END, StateGraph
 from loguru import logger
 from pinecone import Pinecone
 from pydantic import BaseModel, Field
+
+# Optional imports for advanced features
+try:
+    from langchain.retrievers import EnsembleRetriever, MultiQueryRetriever
+    from langchain_community.retrievers import BM25Retriever
+    from langchain_pinecone import PineconeRerank
+    ADVANCED_RETRIEVAL_AVAILABLE = True
+except ImportError:
+    ADVANCED_RETRIEVAL_AVAILABLE = False
+    logger.warning("Advanced retrieval features not available. Install: langchain-pinecone, langchain-community")
+
+try:
+    from langchain.chains import LLMChain
+    from langchain.prompts import PromptTemplate
+    HYDE_AVAILABLE = True
+except ImportError:
+    HYDE_AVAILABLE = False
+    logger.warning("HyDE query transformation not available.")
 
 
 class SourcePayload(TypedDict):
@@ -33,6 +52,10 @@ class ChatState(TypedDict, total=False):
     context: str
     sources: list[SourcePayload]
     answer: str
+    # Advanced retrieval fields
+    reranked_docs: list[Document]  # After reranking
+    query_variants: list[str]  # For multi-query expansion
+    hyde_doc: str  # Hypothetical document for HyDE
 
 
 class IntentScores(BaseModel):
@@ -74,12 +97,27 @@ class ChatService:
         self._greeting_threshold = self._read_threshold("INTENT_GREETING_THRESHOLD", 0.75)
         self._out_of_domain_threshold = self._read_threshold("INTENT_OUT_OF_DOMAIN_THRESHOLD", 0.65)
 
+        # Advanced retrieval configuration
+        self._use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "true").lower() == "true"
+        self._use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
+        self._use_hyde = os.getenv("USE_HYDE", "false").lower() == "true"
+        self._use_multi_query = os.getenv("USE_MULTI_QUERY", "false").lower() == "true"
+        self._score_threshold = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.75"))
+        self._rerank_top_n = int(os.getenv("RERANK_TOP_N", "5"))
+        self._retrieval_k = int(os.getenv("RETRIEVAL_K", "20"))  # Initial retrieval count
+
         self._embeddings = DimensionAwareGeminiEmbeddings(
             model=self._embedding_model,
             google_api_key=self._gemini_key,
             target_dim=self._target_dim,
         )
         self._index = Pinecone(api_key=self._pinecone_key).Index(self._index_name)
+
+        # Initialize advanced retrieval components
+        self._retriever = self._init_retriever()
+        self._reranker = self._init_reranker() if self._use_reranking else None
+        self._hyde_chain = self._init_hyde() if self._use_hyde else None
+        self._multi_query_chain = self._init_multi_query() if self._use_multi_query else None
 
         self._answer_prompt = ChatPromptTemplate.from_messages(
             [
@@ -137,6 +175,86 @@ class ChatService:
         self._intent_chain = self._intent_prompt | llm.with_structured_output(IntentScores)
         self._graph = self._build_graph()
 
+    def _init_retriever(self):
+        """Initialize the retriever with optional hybrid search."""
+        if not ADVANCED_RETRIEVAL_AVAILABLE or not self._use_hybrid_search:
+            logger.info("Using basic vector retriever")
+            return None  # Will use direct Pinecone query
+
+        try:
+            from langchain_pinecone import PineconeVectorStore
+            
+            vectorstore = PineconeVectorStore(
+                index=self._index,
+                embedding=self._embeddings,
+                text_key="text"
+            )
+            
+            # Dense retriever
+            dense_retriever = vectorstore.as_retriever(
+                search_type="similarity_score_threshold",
+                search_kwargs={
+                    "k": self._retrieval_k,
+                    "score_threshold": self._score_threshold
+                }
+            )
+            
+            # TODO: Add BM25 sparse retriever for full hybrid search
+            # This requires document store setup
+            
+            return dense_retriever
+        except Exception as e:
+            logger.warning(f"Failed to initialize advanced retriever: {e}")
+            return None
+
+    def _init_reranker(self):
+        """Initialize the reranker for improved precision."""
+        if not ADVANCED_RETRIEVAL_AVAILABLE:
+            return None
+        try:
+            return PineconeRerank(
+                model="bge-reranker-v2-m3",
+                top_n=self._rerank_top_n
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize reranker: {e}")
+            return None
+
+    def _init_hyde(self):
+        """Initialize HyDE (Hypothetical Document Embeddings) chain."""
+        if not HYDE_AVAILABLE:
+            return None
+        try:
+            llm = ChatGoogleGenerativeAI(
+                model=self._chat_model,
+                google_api_key=self._gemini_key,
+                temperature=0.3,
+            )
+            hyde_prompt = PromptTemplate(
+                input_variables=["question"],
+                template="Please write a detailed passage that could answer the following question:\n{question}"
+            )
+            return LLMChain(llm=llm, prompt=hyde_prompt)
+        except Exception as e:
+            logger.warning(f"Failed to initialize HyDE: {e}")
+            return None
+
+    def _init_multi_query(self):
+        """Initialize multi-query expansion chain."""
+        if not ADVANCED_RETRIEVAL_AVAILABLE or not HYDE_AVAILABLE:
+            return None
+        try:
+            llm = ChatGoogleGenerativeAI(
+                model=self._chat_model,
+                google_api_key=self._gemini_key,
+                temperature=0.3,
+            )
+            # Will implement manual multi-query in retrieve node
+            return llm
+        except Exception as e:
+            logger.warning(f"Failed to initialize multi-query: {e}")
+            return None
+
     def ask(self, question: str, top_k: int = 5) -> ChatResult:
         state = self._graph.invoke({"question": question, "top_k": top_k})
         return {
@@ -153,6 +271,11 @@ class ChatService:
         graph.add_node("build_context", self._build_context_node)
         graph.add_node("answer", self._answer_node)
 
+        # Add reranking node if enabled
+        if self._reranker and self._use_reranking:
+            graph.add_node("rerank", self._rerank_node)
+            logger.info("Reranking node added to graph")
+
         graph.set_entry_point("classify_intent")
         graph.add_conditional_edges(
             "classify_intent",
@@ -167,7 +290,14 @@ class ChatService:
 
         graph.add_edge("greeting_response", END)
         graph.add_edge("out_of_domain_response", END)
-        graph.add_edge("retrieve", "build_context")
+
+        # Route through reranking if enabled
+        if self._reranker and self._use_reranking:
+            graph.add_edge("retrieve", "rerank")
+            graph.add_edge("rerank", "build_context")
+        else:
+            graph.add_edge("retrieve", "build_context")
+
         graph.add_edge("build_context", "answer")
         graph.add_edge("answer", END)
         return graph.compile()
@@ -237,10 +367,35 @@ class ChatService:
         top_k = int(state.get("top_k", 5))
         top_k = max(1, min(top_k, 20))
 
-        query_vector = self._embeddings.embed_query(question)
+        # Apply query transformation if enabled
+        query_for_retrieval = question
+        hyde_doc = None
+
+        if self._hyde_chain and self._use_hyde:
+            try:
+                hyde_doc = self._hyde_chain.invoke({"question": question})["text"]
+                query_for_retrieval = hyde_doc
+                logger.debug(f"HyDE generated hypothetical document")
+            except Exception as e:
+                logger.warning(f"HyDE failed, using original query: {e}")
+
+        # Use advanced retriever if available
+        if self._retriever and self._use_hybrid_search:
+            try:
+                docs = self._retriever.invoke(query_for_retrieval)
+                retrieved = [(doc, 1.0) for doc in docs]  # Score not available from retriever
+                return {
+                    "retrieved": retrieved,
+                    "hyde_doc": hyde_doc,
+                }
+            except Exception as e:
+                logger.warning(f"Advanced retriever failed, falling back to direct query: {e}")
+
+        # Fallback: direct Pinecone query
+        query_vector = self._embeddings.embed_query(query_for_retrieval)
         result = self._index.query(
             vector=query_vector,
-            top_k=top_k,
+            top_k=self._retrieval_k if self._use_reranking else top_k,
             include_metadata=True,
         )
 
@@ -262,10 +417,36 @@ class ChatService:
                 )
             )
 
-        return {"retrieved": retrieved}
+        return {"retrieved": retrieved, "hyde_doc": hyde_doc}
+
+    def _rerank_node(self, state: ChatState) -> ChatState:
+        """Rerank retrieved documents for better precision."""
+        if not self._reranker or not self._use_reranking:
+            return state
+
+        retrieved = state.get("retrieved", [])
+        if not retrieved:
+            return state
+
+        try:
+            docs = [doc for doc, score in retrieved]
+            query = state.get("question", "")
+
+            # PineconeRerank expects documents and query
+            reranked_docs = self._reranker.compress_documents(docs, query)
+
+            # Convert back to retrieved format with new scores
+            reranked = [(doc, doc.metadata.get("relevance_score", 0.0)) for doc in reranked_docs]
+            return {"reranked_docs": reranked}
+        except Exception as e:
+            logger.warning(f"Reranking failed: {e}")
+            return state
 
     def _build_context_node(self, state: ChatState) -> ChatState:
-        retrieved = state.get("retrieved", [])
+        # Use reranked docs if available, otherwise use retrieved
+        reranked = state.get("reranked_docs")
+        retrieved = reranked if reranked else state.get("retrieved", [])
+
         sections: list[str] = []
         sources: list[SourcePayload] = []
 

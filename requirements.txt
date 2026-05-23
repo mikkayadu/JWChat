@@ -9,6 +9,9 @@ langchain
 langchain-core
 langchain-google-genai
 langchain-text-splitters
+langchain-community
+langchain-pinecone
+langchain-experimental
 langgraph
 openai-whisper
 pinecone
@@ -21,3 +24,7 @@ redis
 tiktoken
 uvicorn[standard]
 yt-dlp
+
+# RAG improvements dependencies
+ragas
+datasets
