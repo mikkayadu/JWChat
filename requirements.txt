@@ -28,3 +28,4 @@ yt-dlp
 # RAG improvements dependencies
 ragas
 datasets
+rank-bm25
