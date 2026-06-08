@@ -201,4 +201,5 @@ pyrightconfig.json
 *.backup-*/
 .opencode/
 *.tmp
+.tmp/
 .claude
