@@ -2,6 +2,7 @@ import os
 from typing import TypedDict, List, Tuple, Optional
 from enum import Enum
 
+from api.services.ensemble import RAGEnsemble, STRATEGY_MAP, EnsembleResult
 from ingestion.utils.embedder import normalize_vector_dimensions
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -12,15 +13,23 @@ from loguru import logger
 from pinecone import Pinecone
 from pydantic import BaseModel, Field
 
-# Optional imports for advanced features
+# BM25 — import rank_bm25 directly to avoid langchain_community's Pydantic V1
+# dependency, which is incompatible with Python 3.14+
+ADVANCED_RETRIEVAL_AVAILABLE = False
 try:
-    from langchain.retrievers import EnsembleRetriever, MultiQueryRetriever
-    from langchain_community.retrievers import BM25Retriever
-    from langchain_pinecone import PineconeRerank
+    from rank_bm25 import BM25Okapi
     ADVANCED_RETRIEVAL_AVAILABLE = True
 except ImportError:
-    ADVANCED_RETRIEVAL_AVAILABLE = False
-    logger.warning("Advanced retrieval features not available. Install: langchain-pinecone, langchain-community")
+    logger.warning("BM25 retrieval unavailable. Run: .venv/Scripts/pip install rank-bm25")
+
+# Pinecone reranking — langchain-pinecone wrapper tried first; raw inference API
+# is the fallback (also broken by Pydantic V1 on Python 3.14, handled at runtime)
+_LANGCHAIN_RERANK_AVAILABLE = False
+try:
+    from langchain_pinecone import PineconeRerank
+    _LANGCHAIN_RERANK_AVAILABLE = True
+except ImportError:
+    pass  # _PineconeInferenceReranker (defined below) handles this path
 
 try:
     from langchain.chains import LLMChain
@@ -53,9 +62,39 @@ class ChatState(TypedDict, total=False):
     sources: list[SourcePayload]
     answer: str
     # Advanced retrieval fields
-    reranked_docs: list[Document]  # After reranking
+    reranked_docs: list[tuple[Document, float]]  # After reranking
     query_variants: list[str]  # For multi-query expansion
     hyde_doc: str  # Hypothetical document for HyDE
+    ensemble_metadata: dict | None  # Ensemble result metadata
+
+
+class _PineconeInferenceReranker:
+    """Reranker using the Pinecone inference API directly.
+
+    Drop-in fallback for PineconeRerank when langchain-pinecone's wrapper is
+    unavailable (e.g. Python 3.14 / Pydantic V1 incompatibility).
+    Exposes the same compress_documents interface so _rerank_node needs no changes.
+    """
+
+    def __init__(self, client: Pinecone, model: str, top_n: int) -> None:
+        self._client = client
+        self._model = model
+        self._top_n = top_n
+
+    def compress_documents(self, documents: list[Document], query: str) -> list[Document]:
+        results = self._client.inference.rerank(
+            model=self._model,
+            query=query,
+            documents=[doc.page_content for doc in documents],
+            top_n=self._top_n,
+            return_documents=True,
+        )
+        reranked: list[Document] = []
+        for item in results.data:
+            doc = documents[item.index]
+            doc.metadata["relevance_score"] = float(item.score)
+            reranked.append(doc)
+        return reranked
 
 
 class IntentScores(BaseModel):
@@ -102,19 +141,24 @@ class ChatService:
         self._use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
         self._use_hyde = os.getenv("USE_HYDE", "false").lower() == "true"
         self._use_multi_query = os.getenv("USE_MULTI_QUERY", "false").lower() == "true"
-        self._score_threshold = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.75"))
         self._rerank_top_n = int(os.getenv("RERANK_TOP_N", "5"))
         self._retrieval_k = int(os.getenv("RETRIEVAL_K", "20"))  # Initial retrieval count
+        self._bm25_alpha = float(os.getenv("BM25_HYBRID_ALPHA", "0.6"))  # Weight for dense vs BM25
+
+        # Ensemble reasoning configuration
+        self._use_ensemble = os.getenv("USE_ENSEMBLE", "false").lower() == "true"
+        self._ensemble_show_metadata = os.getenv("ENSEMBLE_SHOW_METADATA", "false").lower() == "true"
+        self._ensemble_similarity_threshold = float(os.getenv("ENSEMBLE_SIMILARITY_THRESHOLD", "0.85"))
 
         self._embeddings = DimensionAwareGeminiEmbeddings(
             model=self._embedding_model,
             google_api_key=self._gemini_key,
             target_dim=self._target_dim,
         )
-        self._index = Pinecone(api_key=self._pinecone_key).Index(self._index_name)
+        self._pinecone_client = Pinecone(api_key=self._pinecone_key)
+        self._index = self._pinecone_client.Index(self._index_name)
 
         # Initialize advanced retrieval components
-        self._retriever = self._init_retriever()
         self._reranker = self._init_reranker() if self._use_reranking else None
         self._hyde_chain = self._init_hyde() if self._use_hyde else None
         self._multi_query_chain = self._init_multi_query() if self._use_multi_query else None
@@ -132,7 +176,8 @@ class ChatService:
                     "2. If the answer is not found in the context, respond exactly: "
                     "'I could not find information about this in the provided sources.'\n"
                     "3. Cite every factual claim with inline source references like [1], [2], etc.\n"
-                    "4. Never speculate, paraphrase beyond what the source supports, or fill gaps.\n\n"
+                    "4. Explain and restate the source content clearly in your own words — "
+                    "but never introduce claims, conclusions, or implications not present in the source.\n\n"
 
                     "RESPONSE FORMAT:\n"
                     "- Be concise and direct.\n"
@@ -171,53 +216,29 @@ class ChatService:
             google_api_key=self._gemini_key,
             temperature=0,
         )
+        self._ensemble = self._init_ensemble(llm) if self._use_ensemble else None
         self._answer_chain = self._answer_prompt | llm
         self._intent_chain = self._intent_prompt | llm.with_structured_output(IntentScores)
         self._graph = self._build_graph()
 
-    def _init_retriever(self):
-        """Initialize the retriever with optional hybrid search."""
-        if not ADVANCED_RETRIEVAL_AVAILABLE or not self._use_hybrid_search:
-            logger.info("Using basic vector retriever")
-            return None  # Will use direct Pinecone query
-
-        try:
-            from langchain_pinecone import PineconeVectorStore
-            
-            vectorstore = PineconeVectorStore(
-                index=self._index,
-                embedding=self._embeddings,
-                text_key="text"
-            )
-            
-            # Dense retriever
-            dense_retriever = vectorstore.as_retriever(
-                search_type="similarity_score_threshold",
-                search_kwargs={
-                    "k": self._retrieval_k,
-                    "score_threshold": self._score_threshold
-                }
-            )
-            
-            # TODO: Add BM25 sparse retriever for full hybrid search
-            # This requires document store setup
-            
-            return dense_retriever
-        except Exception as e:
-            logger.warning(f"Failed to initialize advanced retriever: {e}")
-            return None
-
     def _init_reranker(self):
-        """Initialize the reranker for improved precision."""
-        if not ADVANCED_RETRIEVAL_AVAILABLE:
-            return None
+        """Try langchain-pinecone PineconeRerank first; fall back to raw Pinecone inference API."""
+        if _LANGCHAIN_RERANK_AVAILABLE:
+            try:
+                return PineconeRerank(model="bge-reranker-v2-m3", top_n=self._rerank_top_n)
+            except Exception as e:
+                logger.warning(f"PineconeRerank init failed, falling back to inference API: {e}")
+
         try:
-            return PineconeRerank(
+            reranker = _PineconeInferenceReranker(
+                client=self._pinecone_client,
                 model="bge-reranker-v2-m3",
-                top_n=self._rerank_top_n
+                top_n=self._rerank_top_n,
             )
+            logger.info("Reranking via Pinecone inference API")
+            return reranker
         except Exception as e:
-            logger.warning(f"Failed to initialize reranker: {e}")
+            logger.warning(f"Reranking unavailable: {e}")
             return None
 
     def _init_hyde(self):
@@ -240,27 +261,58 @@ class ChatService:
             return None
 
     def _init_multi_query(self):
-        """Initialize multi-query expansion chain."""
-        if not ADVANCED_RETRIEVAL_AVAILABLE or not HYDE_AVAILABLE:
-            return None
+        """Initialize the LLM used to generate query variants for multi-query expansion."""
         try:
-            llm = ChatGoogleGenerativeAI(
+            return ChatGoogleGenerativeAI(
                 model=self._chat_model,
                 google_api_key=self._gemini_key,
                 temperature=0.3,
             )
-            # Will implement manual multi-query in retrieve node
-            return llm
         except Exception as e:
-            logger.warning(f"Failed to initialize multi-query: {e}")
+            logger.warning(f"Failed to initialize multi-query LLM: {e}")
             return None
+
+    def _init_ensemble(self, llm: ChatGoogleGenerativeAI) -> RAGEnsemble | None:
+        """Parse ENSEMBLE_STRATEGIES, instantiate strategy objects, build the orchestrator."""
+        raw = os.getenv("ENSEMBLE_STRATEGIES", "standard,cot,tot")
+        names = [name.strip().lower() for name in raw.split(",") if name.strip()]
+
+        strategies: dict[str, "ReasoningStrategy"] = {}
+        for name in names:
+            cls = STRATEGY_MAP.get(name)
+            if cls is None:
+                logger.warning(f"Unknown ensemble strategy '{name}' — skipping")
+                continue
+            canonical = cls.name
+            if canonical not in strategies:
+                strategies[canonical] = cls(llm)
+                logger.info(f"[ENSEMBLE] registered strategy '{canonical}'")
+
+        if len(strategies) < 2:
+            logger.warning(
+                f"Ensemble requires at least 2 valid strategies, got {len(strategies)} — "
+                f"disabling ensemble"
+            )
+            self._use_ensemble = False
+            return None
+
+        logger.info(f"[ENSEMBLE] initialized with {len(strategies)} strategies: {list(strategies.keys())}")
+        return RAGEnsemble(
+            strategies=strategies,
+            embeddings=self._embeddings,
+            similarity_threshold=self._ensemble_similarity_threshold,
+        )
 
     def ask(self, question: str, top_k: int = 5) -> ChatResult:
         state = self._graph.invoke({"question": question, "top_k": top_k})
-        return {
+        result: ChatResult = {
             "answer": state.get("answer", "I could not generate a response."),
             "sources": state.get("sources", []),
         }
+        ensemble_metadata = state.get("ensemble_metadata")
+        if ensemble_metadata is not None:
+            result["ensemble_metadata"] = ensemble_metadata
+        return result
 
     def _build_graph(self):
         graph = StateGraph(ChatState)
@@ -366,58 +418,123 @@ class ChatService:
 
         top_k = int(state.get("top_k", 5))
         top_k = max(1, min(top_k, 20))
+        fetch_k = self._retrieval_k if self._use_reranking else top_k * 2
 
-        # Apply query transformation if enabled
-        query_for_retrieval = question
+        logger.info(f"[RETRIEVE] question='{question}' fetch_k={fetch_k} reranking={self._use_reranking} hybrid={self._use_hybrid_search}")
+
+        # Step 1: Build query list — start with original, expand via multi-query
+        queries = [question]
+        if self._multi_query_chain and self._use_multi_query:
+            try:
+                queries = self._expand_queries(question)
+                logger.info(f"[MULTI-QUERY] {len(queries)} queries total:")
+                for i, q in enumerate(queries):
+                    logger.info(f"  [{i}] {q}")
+            except Exception as e:
+                logger.warning(f"Multi-query expansion failed, using original query: {e}")
+
+        # Step 2: HyDE — rewrite the primary query as a hypothetical answer passage
         hyde_doc = None
-
         if self._hyde_chain and self._use_hyde:
             try:
                 hyde_doc = self._hyde_chain.invoke({"question": question})["text"]
-                query_for_retrieval = hyde_doc
-                logger.debug(f"HyDE generated hypothetical document")
+                queries[0] = hyde_doc
+                logger.info(f"[HYDE] hypothetical passage (first 120 chars): {hyde_doc[:120]}")
             except Exception as e:
                 logger.warning(f"HyDE failed, using original query: {e}")
 
-        # Use advanced retriever if available
-        if self._retriever and self._use_hybrid_search:
-            try:
-                docs = self._retriever.invoke(query_for_retrieval)
-                retrieved = [(doc, 1.0) for doc in docs]  # Score not available from retriever
-                return {
-                    "retrieved": retrieved,
-                    "hyde_doc": hyde_doc,
-                }
-            except Exception as e:
-                logger.warning(f"Advanced retriever failed, falling back to direct query: {e}")
+        # Step 3: Fetch for every query variant; deduplicate by content fingerprint
+        seen: dict[str, tuple[Document, float]] = {}
+        for query in queries:
+            hits = self._fetch_from_pinecone(query, fetch_k)
+            logger.info(f"[PINECONE] query='{query[:60]}...' → {len(hits)} hits passed filter")
+            for doc, score in hits:
+                key = doc.page_content[:120]
+                if key not in seen or score > seen[key][1]:
+                    seen[key] = (doc, score)
 
-        # Fallback: direct Pinecone query
-        query_vector = self._embeddings.embed_query(query_for_retrieval)
-        result = self._index.query(
-            vector=query_vector,
-            top_k=self._retrieval_k if self._use_reranking else top_k,
-            include_metadata=True,
-        )
+        retrieved = list(seen.values())
+        logger.info(f"[RETRIEVE] {len(retrieved)} unique docs after dedup")
 
+        # Step 4: BM25 hybrid re-scoring — combine dense scores with keyword scores
+        if self._use_hybrid_search and retrieved:
+            retrieved = self._apply_bm25_fusion(question, retrieved)
+            logger.info(f"[BM25] top-3 fused scores: {[round(s,3) for _,s in retrieved[:5]]}")
+
+        return {
+            "retrieved": retrieved,
+            "hyde_doc": hyde_doc,
+            "query_variants": queries[1:],
+        }
+
+    def _fetch_from_pinecone(self, query: str, k: int) -> list[tuple[Document, float]]:
+        """Embed query and fetch top-k matches from Pinecone above the min score threshold."""
+        query_vector = self._embeddings.embed_query(query)
+        result = self._index.query(vector=query_vector, top_k=k, include_metadata=True)
+        matches = result.get("matches", [])
         min_score = self._read_min_score()
 
-        retrieved: list[tuple[Document, float]] = []
-        for match in result.get("matches", []):
-            metadata = match.get("metadata") or {}
-            page_content = str(metadata.get("text") or "")
-            score = float(match.get("score") or 0.0)
+        all_scores = [float(m.get("score") or 0.0) for m in matches]
+        logger.info(f"[PINECONE RAW] {len(matches)} matches, min_score_filter={min_score}, scores={[round(s,3) for s in all_scores[:10]]}")
 
+        retrieved: list[tuple[Document, float]] = []
+        for match in matches:
+            metadata = match.get("metadata") or {}
+            score = float(match.get("score") or 0.0)
             if score < min_score:
                 continue
+            retrieved.append((
+                Document(page_content=str(metadata.get("text") or ""), metadata=metadata),
+                score,
+            ))
+        return retrieved
 
-            retrieved.append(
-                (
-                    Document(page_content=page_content, metadata=metadata),
-                    score,
-                )
-            )
+    def _expand_queries(self, question: str) -> list[str]:
+        """Ask the LLM for 3 reformulations of the question, return original + variants."""
+        prompt = (
+            "Generate 3 different reformulations of the following question to improve document retrieval. "
+            "Each reformulation should approach the topic from a different angle — "
+            "one more specific, one broader, one using different terminology. "
+            "Return only the reformulations, one per line, no numbering or bullets.\n\n"
+            f"Original question: {question}"
+        )
+        response = self._multi_query_chain.invoke(prompt)
+        raw = getattr(response, "content", str(response)).strip()
+        variants = [line.strip() for line in raw.splitlines() if line.strip()]
+        return [question] + variants[:3]
 
-        return {"retrieved": retrieved, "hyde_doc": hyde_doc}
+    def _apply_bm25_fusion(
+        self, question: str, retrieved: list[tuple[Document, float]]
+    ) -> list[tuple[Document, float]]:
+        """Re-score dense results with BM25 and combine via weighted sum (sparse-dense fusion).
+
+        Dense vectors capture semantic similarity; BM25 rewards exact keyword overlap.
+        Combining them improves results for both vague and keyword-specific queries.
+        alpha controls how much weight the dense score carries.
+        """
+        if not ADVANCED_RETRIEVAL_AVAILABLE or len(retrieved) < 2:
+            return retrieved
+
+        try:
+            docs = [doc for doc, _ in retrieved]
+
+            # Tokenise and score directly with BM25Okapi (pure Python, no Pydantic)
+            tokenized_corpus = [doc.page_content.lower().split() for doc in docs]
+            bm25 = BM25Okapi(tokenized_corpus)
+            raw_scores = bm25.get_scores(question.lower().split())
+
+            # Normalise to [0, 1] so scores are comparable with dense cosine scores
+            max_score = max(raw_scores) if max(raw_scores) > 0 else 1.0
+            norm_scores = [s / max_score for s in raw_scores]
+
+            fused = [
+                (doc, self._bm25_alpha * dense + (1 - self._bm25_alpha) * norm_scores[i])
+                for i, (doc, dense) in enumerate(retrieved)
+            ]
+            return sorted(fused, key=lambda x: x[1], reverse=True)
+        except Exception as e:
+            logger.warning(f"BM25 fusion failed, returning dense results: {e}")
+            return retrieved
 
     def _rerank_node(self, state: ChatState) -> ChatState:
         """Rerank retrieved documents for better precision."""
@@ -475,6 +592,7 @@ class ChatService:
 
     def _answer_node(self, state: ChatState) -> ChatState:
         if not state.get("retrieved"):
+            logger.warning("[ANSWER] retrieved is empty — no docs passed retrieval/filtering")
             return {"answer": "I could not find relevant content in the indexed books yet."}
 
         context = (state.get("context") or "").strip()
@@ -482,13 +600,47 @@ class ChatService:
             return {"answer": "I found matches, but they did not contain readable text content."}
 
         question = state.get("question", "")
+
+        if self._use_ensemble and self._ensemble is not None:
+            try:
+                result: EnsembleResult = self._ensemble.run_sync(question, context)
+                winner = result["winner"]
+                answer_text = winner.get("answer") or ""
+
+                if not answer_text:
+                    logger.warning("[ENSEMBLE] winner had no answer — falling back to single-shot")
+                    return {"answer": self._single_shot_answer(question, context)}
+
+                metadata = {
+                    "winning_strategy": winner.get("strategy"),
+                    "vote_count": winner.get("vote_count", 0),
+                    "total_candidates": len(result.get("candidates", [])),
+                    "cluster_sizes": [len(c) for c in result.get("clusters", [])],
+                    "total_duration_ms": round(result.get("total_duration_ms", 0), 1),
+                    "candidate_strategies": [
+                        {
+                            "name": c["strategy"],
+                            "duration_ms": round(c["duration_ms"], 1),
+                            "error": c["error"],
+                        }
+                        for c in result.get("candidates", [])
+                    ],
+                }
+
+                return {
+                    "answer": answer_text,
+                    "ensemble_metadata": metadata if self._ensemble_show_metadata else None,
+                }
+
+            except Exception as e:
+                logger.error(f"[ENSEMBLE] failed — falling back to single-shot answer: {e}")
+
+        return {"answer": self._single_shot_answer(question, context)}
+
+    def _single_shot_answer(self, question: str, context: str) -> str:
         response = self._answer_chain.invoke({"question": question, "context": context})
         answer_text = (getattr(response, "content", "") or str(response)).strip()
-
-        if not answer_text:
-            answer_text = "I could not generate a response."
-
-        return {"answer": answer_text}
+        return answer_text or "I could not generate a response."
 
     @staticmethod
     def _require_env(name: str) -> str:
@@ -510,13 +662,13 @@ class ChatService:
 
     @staticmethod
     def _read_min_score() -> float:
-        raw = os.getenv("RETRIEVAL_MIN_SCORE", "0.0")
+        raw = os.getenv("RETRIEVAL_MIN_SCORE", "0.5")
         try:
             value = float(raw)
             return max(0.0, min(value, 1.0))
         except ValueError:
-            logger.warning(f"Invalid RETRIEVAL_MIN_SCORE='{raw}'. Using 0.0.")
-            return 0.0
+            logger.warning(f"Invalid RETRIEVAL_MIN_SCORE='{raw}'. Using 0.5.")
+            return 0.5
 
     @staticmethod
     def _read_threshold(name: str, default: float) -> float:
