@@ -25,9 +25,25 @@ class SourceItem(BaseModel):
     snippet: str
 
 
+class EnsembleCandidateInfo(BaseModel):
+    name: str
+    duration_ms: float
+    error: bool
+
+
+class EnsembleMetadata(BaseModel):
+    winning_strategy: str | None
+    vote_count: int
+    total_candidates: int
+    cluster_sizes: list[int]
+    total_duration_ms: float
+    candidate_strategies: list[EnsembleCandidateInfo]
+
+
 class ChatResponse(BaseModel):
     answer: str
     sources: list[SourceItem]
+    ensemble_metadata: EnsembleMetadata | None = None
 
 
 app = FastAPI(title="Book Chatbot API", version="1.0.0")
@@ -65,9 +81,11 @@ def health() -> dict[str, str]:
 def chat(req: ChatRequest) -> ChatResponse:
     try:
         result = _get_chat_service().ask(req.question, req.top_k)
+        ensemble_meta = result.get("ensemble_metadata")
         return ChatResponse(
             answer=result["answer"],
             sources=[SourceItem(**source) for source in result["sources"]],
+            ensemble_metadata=EnsembleMetadata(**ensemble_meta) if ensemble_meta else None,
         )
 
     except RuntimeError as e:
