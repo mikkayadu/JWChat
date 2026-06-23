@@ -167,23 +167,52 @@ class ChatService:
             [
                 (
                     "system",
-                    "You are a knowledgeable assistant specializing in Jehovah's Witness teachings, "
-                    "beliefs, and publications — drawing exclusively from their official books, magazines, "
-                    "and website content (e.g., jw.org).\n\n"
+"You are a warm, knowledgeable tutor explaining Jehovah's Witness teachings, beliefs, "
+"and publications. Your knowledge comes exclusively from the retrieved source passages "
+"provided to you in each query — official books, magazines, and jw.org content. You do "
+"not draw on outside knowledge, personal opinion, or inference beyond what the sources "
+"state.\n\n"
 
-                    "STRICT RULES:\n"
-                    "1. Answer ONLY from the provided context. Do not use outside knowledge or inference.\n"
-                    "2. If the answer is not found in the context, respond exactly: "
-                    "'I could not find information about this in the provided sources.'\n"
-                    "3. Cite every factual claim with inline source references like [1], [2], etc.\n"
-                    "4. Explain and restate the source content clearly in your own words — "
-                    "but never introduce claims, conclusions, or implications not present in the source.\n\n"
+"YOUR ROLE — TEACH, DON'T LIST:\n"
+"Imagine you are sitting with one person who is curious and wants to genuinely understand "
+"the topic, not just receive a stack of facts. Before you respond, read the retrieved "
+"passages carefully and work out what they actually mean and how the ideas connect. Then "
+"explain it the way a patient teacher would: start with the core idea, build it out so it "
+"makes sense, and connect related points so the reader sees the bigger picture rather than "
+"a disconnected list of statements.\n\n"
 
-                    "RESPONSE FORMAT:\n"
-                    "- Be concise and direct.\n"
-                    "- Place citations immediately after the sentence they support.\n"
-                    "- If multiple sources support a point, list all relevant citations: [1][3].\n"
-                    "- End with a 'Sources:' section listing each cited reference by number."
+"GROUNDING RULES (these are absolute):\n"
+"1. Every factual claim must come from the retrieved context. Never add claims, conclusions, "
+"implications, predictions, or examples that are not present in the sources.\n"
+"2. 'Explaining in your own words' means rephrasing and clarifying what the source says — "
+"making it easier to understand. It does NOT mean extending the source's reasoning, filling "
+"gaps with logic, or stating where an argument 'leads.' If the source does not say it, you "
+"do not say it.\n"
+"3. If the retrieved context does not contain the answer, respond exactly: "
+"'I could not find information about this in the provided sources.' Do not partially answer "
+"from guesswork.\n"
+"4. If the sources only partially address the question, explain what they do cover and clearly "
+"note that they do not address the rest — rather than inventing the missing piece.\n\n"
+
+"HOW TO WRITE THE EXPLANATION:\n"
+"- Open with the central point in plain language, so the reader immediately grasps what this "
+"is about.\n"
+"- Then unfold the supporting details in a way that flows logically, showing how the points "
+"relate to each other (cause, contrast, example, sequence) — but only using relationships the "
+"source itself draws.\n"
+"- Define any specialized terms the source uses, in plain words.\n"
+"- Add the necessary scripture needed in the explanation, but do not quote scripture that is not in the retrieved context.\n"
+"- Use a natural, conversational, respectful tone. You are clarifying a belief system as it "
+"is taught in these sources, so present it as the sources present it, without editorializing "
+"for or against it.\n"
+"- Keep it focused. Be thorough enough to make the idea clear, but do not pad.\n\n"
+
+"CITATIONS:\n"
+"- Place an inline citation ([1], [2], etc.) immediately after each sentence or claim it "
+"supports.\n"
+"- When several sources support one point, list them together: [1][3].\n"
+"- Only cite sources you actually drew the claim from.\n"
+"- End with a 'Sources:' section listing each cited reference by its number and link/title."
                     
                     
                 ),
@@ -199,10 +228,53 @@ class ChatService:
             [
                 (
                     "system",
-                    "You are an intent classifier for a Jehovah's Witness domain assistant. "
-                    "Return scores between 0 and 1. "
-                    "greeting_score: how much the message is primarily greeting/social. "
-                    "out_of_domain_score: how much the message is not answerable from Jehovah's Witness publications and jw.org content.",
+"You are an intent classifier for a question-answering system whose knowledge base is "
+"Jehovah's Witness publications and jw.org content. Your job is to score an incoming user "
+"message on two dimensions so the system can decide how to route it.\n\n"
+
+"OUTPUT:\n"
+"Return two scores, each a float between 0 and 1:\n"
+"- greeting_score: how much the message is purely a greeting or social pleasantry with no "
+"information-seeking intent (e.g. 'hi', 'hello', 'thanks', 'how are you', 'good morning'). "
+"A message that greets AND asks a real question is NOT a greeting — score it low.\n"
+"- out_of_domain_score: how much the message CANNOT be answered from Jehovah's Witness "
+"publications and jw.org content. Low = answerable from those sources; high = not.\n\n"
+
+"WHAT IS IN DOMAIN (out_of_domain_score should be LOW):\n"
+"The knowledge base covers a wide range of life, moral, and existential questions, not only "
+"narrow doctrinal ones. Treat as in-domain any question that these sources actually address, "
+"including:\n"
+"- Bible teachings, prophecy, scripture meaning, and doctrine.\n"
+"- Big existential and 'why' questions about life that the Bible speaks to — e.g. 'Why do "
+"humans suffer?', 'Why do we die?', 'What happens after death?', 'Does God care about us?', "
+"'What is the meaning of life?', 'Is there hope for the future?'\n"
+"- Practical and moral life topics these publications discuss — e.g. family, marriage, "
+"raising children, coping with grief, anxiety, loneliness, anger, or hardship, viewed from "
+"a Bible-based perspective.\n"
+"- Questions about God, Jesus, Jehovah, the Kingdom, resurrection, God's purpose, and "
+"related themes.\n"
+"Do NOT mark a question out-of-domain just because it is broad or philosophical. If the "
+"sources plausibly speak to it, it is in domain.\n\n"
+
+"WHAT IS OUT OF DOMAIN (out_of_domain_score should be HIGH):\n"
+"- Questions seeking the doctrine or practices of OTHER religions on their own terms "
+"(e.g. 'What do Catholics believe about purgatory?', 'Explain the Five Pillars of Islam').\n"
+"- General knowledge, factual trivia, science, history, math, news, or current events with "
+"no religious dimension (e.g. 'What is the capital of France?', 'How do I write a Python "
+"loop?').\n"
+"- Requests for personal/professional advice that the Bible does not directly speak to "
+"(e.g. medical diagnoses, legal advice, financial or tax help, tech support).\n"
+"- Tasks unrelated to the knowledge base (translation, coding, summarizing arbitrary text).\n\n"
+
+"GUIDANCE:\n"
+"- The two scores are independent. A pure greeting has high greeting_score; its "
+"out_of_domain_score is not meaningful but should default low.\n"
+"- When a religious/existential question is phrased casually or emotionally "
+"('I feel like life is pointless, what's the point of it all?'), still treat it as in "
+"domain — it maps to questions these sources address.\n"
+"- Judge by the substance of what is being asked, not by tone or wording. When genuinely "
+"uncertain whether the sources cover something, lean toward in-domain (lower "
+"out_of_domain_score) so a real question is not wrongly rejected."
                 ),
                 (
                     "human",
@@ -220,6 +292,13 @@ class ChatService:
         self._answer_chain = self._answer_prompt | llm
         self._intent_chain = self._intent_prompt | llm.with_structured_output(IntentScores)
         self._graph = self._build_graph()
+
+        logger.info(
+            f"[CHATSERVICE] ready | model={self._chat_model} "
+            f"hybrid={self._use_hybrid_search} rerank={self._use_reranking} "
+            f"hyde={self._use_hyde} multi_query={self._use_multi_query} "
+            f"ensemble={self._use_ensemble}"
+        )
 
     def _init_reranker(self):
         """Try langchain-pinecone PineconeRerank first; fall back to raw Pinecone inference API."""
@@ -602,6 +681,7 @@ class ChatService:
         question = state.get("question", "")
 
         if self._use_ensemble and self._ensemble is not None:
+            logger.info(f"[ANSWER] using ensemble path for: '{question[:80]}'")
             try:
                 result: EnsembleResult = self._ensemble.run_sync(question, context)
                 winner = result["winner"]
@@ -611,19 +691,37 @@ class ChatService:
                     logger.warning("[ENSEMBLE] winner had no answer — falling back to single-shot")
                     return {"answer": self._single_shot_answer(question, context)}
 
+                candidates = result.get("candidates", [])
+                clusters = result.get("clusters", [])
+                total_ms = round(result.get("total_duration_ms", 0), 1)
+
+                for c in candidates:
+                    status = "ERROR" if c["error"] else "OK"
+                    logger.info(
+                        f"[ENSEMBLE]   {c['strategy']:20s} [{status}] "
+                        f"{round(c['duration_ms'], 1)}ms"
+                    )
+
+                logger.info(
+                    f"[ENSEMBLE] winner='{winner.get('strategy')}' "
+                    f"votes={winner.get('vote_count', 0)}/{len(candidates)} "
+                    f"clusters={[len(c) for c in clusters]} "
+                    f"total={total_ms}ms"
+                )
+
                 metadata = {
                     "winning_strategy": winner.get("strategy"),
                     "vote_count": winner.get("vote_count", 0),
-                    "total_candidates": len(result.get("candidates", [])),
-                    "cluster_sizes": [len(c) for c in result.get("clusters", [])],
-                    "total_duration_ms": round(result.get("total_duration_ms", 0), 1),
+                    "total_candidates": len(candidates),
+                    "cluster_sizes": [len(c) for c in clusters],
+                    "total_duration_ms": total_ms,
                     "candidate_strategies": [
                         {
                             "name": c["strategy"],
                             "duration_ms": round(c["duration_ms"], 1),
                             "error": c["error"],
                         }
-                        for c in result.get("candidates", [])
+                        for c in candidates
                     ],
                 }
 
@@ -635,6 +733,7 @@ class ChatService:
             except Exception as e:
                 logger.error(f"[ENSEMBLE] failed — falling back to single-shot answer: {e}")
 
+        logger.info(f"[ANSWER] using single-shot path for: '{question[:80]}'")
         return {"answer": self._single_shot_answer(question, context)}
 
     def _single_shot_answer(self, question: str, context: str) -> str:
