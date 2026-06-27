@@ -3,11 +3,10 @@ from typing import TypedDict, List, Tuple, Optional
 from enum import Enum
 
 from api.services.ensemble import RAGEnsemble, STRATEGY_MAP, EnsembleResult
-from ingestion.utils.embedder import normalize_vector_dimensions
+from api.services.providers import ModelFactory
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langgraph.graph import END, StateGraph
 from loguru import logger
 from pinecone import Pinecone
@@ -54,6 +53,7 @@ class ChatResult(TypedDict):
 class ChatState(TypedDict, total=False):
     question: str
     top_k: int
+    mode: str
     intent: str
     greeting_score: float
     out_of_domain_score: float
@@ -61,11 +61,10 @@ class ChatState(TypedDict, total=False):
     context: str
     sources: list[SourcePayload]
     answer: str
-    # Advanced retrieval fields
-    reranked_docs: list[tuple[Document, float]]  # After reranking
-    query_variants: list[str]  # For multi-query expansion
-    hyde_doc: str  # Hypothetical document for HyDE
-    ensemble_metadata: dict | None  # Ensemble result metadata
+    reranked_docs: list[tuple[Document, float]]
+    query_variants: list[str]
+    hyde_doc: str
+    ensemble_metadata: dict | None
 
 
 class _PineconeInferenceReranker:
@@ -102,36 +101,17 @@ class IntentScores(BaseModel):
     out_of_domain_score: float = Field(ge=0.0, le=1.0)
 
 
-class DimensionAwareGeminiEmbeddings(Embeddings):
-    """Wrap Gemini embeddings so vectors always match Pinecone index dimension."""
-
-    def __init__(self, model: str, google_api_key: str, target_dim: int) -> None:
-        self._target_dim = target_dim
-        self._base = GoogleGenerativeAIEmbeddings(
-            model=model,
-            google_api_key=google_api_key,
-        )
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        vectors = self._base.embed_documents(texts)
-        if self._target_dim <= 0:
-            return vectors
-        return [normalize_vector_dimensions(v, self._target_dim) for v in vectors]
-
-    def embed_query(self, text: str) -> list[float]:
-        vector = self._base.embed_query(text)
-        if self._target_dim <= 0:
-            return vector
-        return normalize_vector_dimensions(vector, self._target_dim)
-
-
 class ChatService:
     def __init__(self) -> None:
-        self._gemini_key = self._require_env("GEMINI_API_KEY")
         self._pinecone_key = self._require_env("PINECONE_API_KEY")
         self._index_name = os.getenv("PINECONE_INDEX", "website-rag")
-        self._embedding_model = os.getenv("EMBEDDING_MODEL", "models/embedding-001")
-        self._chat_model = os.getenv("CHAT_MODEL", "gemini-2.5-flash")
+        self._llm_provider = os.getenv("LLM_PROVIDER", "google")
+        self._embeddings_provider = os.getenv("EMBEDDINGS_PROVIDER", "google")
+        self._embedding_model = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
+        # No hardcoded default: each provider supplies its own (Gemini for google,
+        # Llama for ollama, …) when CHAT_MODEL is unset, so switching LLM_PROVIDER
+        # doesn't drag a Gemini model name onto another backend.
+        self._chat_model = os.getenv("CHAT_MODEL")
         self._target_dim = self._read_target_dim()
         self._greeting_threshold = self._read_threshold("INTENT_GREETING_THRESHOLD", 0.75)
         self._out_of_domain_threshold = self._read_threshold("INTENT_OUT_OF_DOMAIN_THRESHOLD", 0.65)
@@ -150,18 +130,20 @@ class ChatService:
         self._ensemble_show_metadata = os.getenv("ENSEMBLE_SHOW_METADATA", "false").lower() == "true"
         self._ensemble_similarity_threshold = float(os.getenv("ENSEMBLE_SIMILARITY_THRESHOLD", "0.85"))
 
-        self._embeddings = DimensionAwareGeminiEmbeddings(
+        # Credentials/endpoints are resolved by each provider from the environment
+        # (GEMINI_API_KEY for google, OLLAMA_BASE_URL for ollama, …) so this
+        # service stays provider-agnostic — it only chooses *which* backend.
+        self._embeddings = ModelFactory.create_embeddings(
+            self._embeddings_provider,
             model=self._embedding_model,
-            google_api_key=self._gemini_key,
             target_dim=self._target_dim,
         )
         self._pinecone_client = Pinecone(api_key=self._pinecone_key)
         self._index = self._pinecone_client.Index(self._index_name)
 
-        # Initialize advanced retrieval components
-        self._reranker = self._init_reranker() if self._use_reranking else None
+        self._reranker = self._init_reranker()
         self._hyde_chain = self._init_hyde() if self._use_hyde else None
-        self._multi_query_chain = self._init_multi_query() if self._use_multi_query else None
+        self._multi_query_chain = self._init_multi_query()
 
         self._answer_prompt = ChatPromptTemplate.from_messages(
             [
@@ -212,7 +194,6 @@ class ChatService:
 "supports.\n"
 "- When several sources support one point, list them together: [1][3].\n"
 "- Only cite sources you actually drew the claim from.\n"
-"- End with a 'Sources:' section listing each cited reference by its number and link/title."
                     
                     
                 ),
@@ -283,18 +264,41 @@ class ChatService:
             ]
         )
 
-        llm = ChatGoogleGenerativeAI(
+        primary_llm = ModelFactory.create_llm(
+            self._llm_provider,
             model=self._chat_model,
-            google_api_key=self._gemini_key,
             temperature=0,
         )
-        self._ensemble = self._init_ensemble(llm) if self._use_ensemble else None
-        self._answer_chain = self._answer_prompt | llm
-        self._intent_chain = self._intent_prompt | llm.with_structured_output(IntentScores)
+        # Optional ordered chain of fallback LLMs (e.g. Gemini → Groq 8b → Groq 70b).
+        # LangChain's with_fallbacks takes a LIST tried left-to-right: it catches
+        # ANY failure of the one before it (rate limit/quota, timeout, 5xx, network)
+        # and advances to the next, and it supports .stream(). So callers never
+        # branch on which backend answered.
+        self._fallback_descs: list[str] = []
+        fallback_llms = self._init_fallback_llms()
+
+        # Ensemble strategies need a concrete chat model; give them the primary.
+        # Only build it when explicitly enabled — otherwise skip the startup cost.
+        self._ensemble = self._init_ensemble(primary_llm) if self._use_ensemble else None
+
+        answer_llm = primary_llm.with_fallbacks(fallback_llms) if fallback_llms else primary_llm
+        self._answer_chain = self._answer_prompt | answer_llm
+
+        intent_runnable = primary_llm.with_structured_output(IntentScores)
+        if fallback_llms:
+            intent_runnable = intent_runnable.with_fallbacks(
+                [fb.with_structured_output(IntentScores) for fb in fallback_llms]
+            )
+        self._intent_chain = self._intent_prompt | intent_runnable
+
         self._graph = self._build_graph()
 
+        fallback_desc = " → ".join(self._fallback_descs) if self._fallback_descs else "none"
         logger.info(
-            f"[CHATSERVICE] ready | model={self._chat_model} "
+            f"[CHATSERVICE] ready | llm_provider={self._llm_provider} "
+            f"model={self._chat_model or '(provider default)'} "
+            f"fallbacks=[{fallback_desc}] "
+            f"embeddings_provider={self._embeddings_provider} "
             f"hybrid={self._use_hybrid_search} rerank={self._use_reranking} "
             f"hyde={self._use_hyde} multi_query={self._use_multi_query} "
             f"ensemble={self._use_ensemble}"
@@ -325,9 +329,9 @@ class ChatService:
         if not HYDE_AVAILABLE:
             return None
         try:
-            llm = ChatGoogleGenerativeAI(
+            llm = ModelFactory.create_llm(
+                self._llm_provider,
                 model=self._chat_model,
-                google_api_key=self._gemini_key,
                 temperature=0.3,
             )
             hyde_prompt = PromptTemplate(
@@ -342,16 +346,54 @@ class ChatService:
     def _init_multi_query(self):
         """Initialize the LLM used to generate query variants for multi-query expansion."""
         try:
-            return ChatGoogleGenerativeAI(
+            return ModelFactory.create_llm(
+                self._llm_provider,
                 model=self._chat_model,
-                google_api_key=self._gemini_key,
                 temperature=0.3,
             )
         except Exception as e:
             logger.warning(f"Failed to initialize multi-query LLM: {e}")
             return None
 
-    def _init_ensemble(self, llm: ChatGoogleGenerativeAI) -> RAGEnsemble | None:
+    def _init_fallback_llms(self) -> list[BaseChatModel]:
+        """Build an ordered list of fallback chat models, tried in sequence.
+
+        Configured via ``FALLBACKS`` — a comma-separated list of ``provider:model``
+        entries, e.g. ``groq:llama-3.1-8b-instant,groq:llama-3.3-70b-versatile``.
+        Each entry is split on the FIRST colon only, because model names may
+        themselves contain ':' (e.g. ollama ``qwen2.5:1.5b``). A bare ``provider``
+        (no colon) uses that provider's default model.
+
+        Falls back to the legacy single ``FALLBACK_LLM_PROVIDER`` /
+        ``FALLBACK_CHAT_MODEL`` pair when ``FALLBACKS`` is unset. Entries that fail
+        to construct are skipped (logged) so one bad provider can't break startup.
+        """
+        specs: list[tuple[str, str | None]] = []
+        raw = os.getenv("FALLBACKS", "").strip()
+        if raw:
+            for entry in raw.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                provider, _, model = entry.partition(":")  # split on first ':' only
+                specs.append((provider.strip(), model.strip() or None))
+        elif os.getenv("FALLBACK_LLM_PROVIDER"):  # legacy single-fallback config
+            specs.append((os.getenv("FALLBACK_LLM_PROVIDER"), os.getenv("FALLBACK_CHAT_MODEL")))
+
+        fallbacks: list[BaseChatModel] = []
+        for provider, model in specs:
+            try:
+                fallbacks.append(ModelFactory.create_llm(provider, model=model, temperature=0))
+                desc = f"{provider}:{model or '(default)'}"
+                self._fallback_descs.append(desc)
+                logger.info(f"[CHATSERVICE] fallback registered | {desc}")
+            except Exception as e:
+                logger.warning(
+                    f"Fallback init failed (provider={provider} model={model}): {e} — skipping"
+                )
+        return fallbacks
+
+    def _init_ensemble(self, llm: BaseChatModel) -> RAGEnsemble | None:
         """Parse ENSEMBLE_STRATEGIES, instantiate strategy objects, build the orchestrator."""
         raw = os.getenv("ENSEMBLE_STRATEGIES", "standard,cot,tot")
         names = [name.strip().lower() for name in raw.split(",") if name.strip()]
@@ -370,9 +412,8 @@ class ChatService:
         if len(strategies) < 2:
             logger.warning(
                 f"Ensemble requires at least 2 valid strategies, got {len(strategies)} — "
-                f"disabling ensemble"
+                f"advanced mode will fall back to single-shot"
             )
-            self._use_ensemble = False
             return None
 
         logger.info(f"[ENSEMBLE] initialized with {len(strategies)} strategies: {list(strategies.keys())}")
@@ -382,8 +423,8 @@ class ChatService:
             similarity_threshold=self._ensemble_similarity_threshold,
         )
 
-    def ask(self, question: str, top_k: int = 5) -> ChatResult:
-        state = self._graph.invoke({"question": question, "top_k": top_k})
+    def ask(self, question: str, top_k: int = 5, mode: str = "normal") -> ChatResult:
+        state = self._graph.invoke({"question": question, "top_k": top_k, "mode": mode})
         result: ChatResult = {
             "answer": state.get("answer", "I could not generate a response."),
             "sources": state.get("sources", []),
@@ -393,19 +434,94 @@ class ChatService:
             result["ensemble_metadata"] = ensemble_metadata
         return result
 
+    def ask_stream(self, question: str, top_k: int = 5, mode: str = "normal"):
+        """Stream a chat answer as transport-agnostic events.
+
+        Yields dicts of the form ``{"event": <name>, "data": <payload>}`` where
+        ``event`` is one of:
+          * ``sources`` — list[SourcePayload], emitted once before any tokens
+          * ``token``   — {"text": str}, one per streamed chunk
+          * ``done``    — {}, terminal success marker
+          * ``error``   — {"detail": str}, terminal failure marker
+
+        Reuses the existing graph nodes (so retrieval/rerank honour ``mode``), then
+        streams the final answer via the fallback-aware answer chain. The ensemble
+        path is intentionally not used here — it produces multiple candidates and
+        does not stream cleanly; advanced mode degrades to a streamed single shot.
+        """
+        try:
+            state: ChatState = {"question": question, "top_k": top_k, "mode": mode}
+            state.update(self._classify_intent_node(state))
+            intent = self._route_intent(state)
+
+            # Greeting / off-topic / error — canned reply, no LLM generation.
+            if intent != "in_domain":
+                if intent == "greeting":
+                    canned = self._greeting_response_node(state)
+                elif intent == "error":
+                    canned = self._service_unavailable_node(state)
+                else:
+                    canned = self._out_of_domain_response_node(state)
+                yield {"event": "sources", "data": []}
+                yield {"event": "token", "data": {"text": canned["answer"]}}
+                yield {"event": "done", "data": {}}
+                return
+
+            # In-domain: mirror the graph edges (retrieve → rerank → build_context).
+            state.update(self._retrieve_node(state))
+            state.update(self._rerank_node(state))
+            state.update(self._build_context_node(state))
+
+            if not state.get("retrieved"):
+                logger.warning("[STREAM] retrieved is empty — no docs passed retrieval/filtering")
+                yield {"event": "sources", "data": []}
+                yield {"event": "token", "data": {"text": "I could not find relevant content in the indexed books yet."}}
+                yield {"event": "done", "data": {}}
+                return
+
+            context = (state.get("context") or "").strip()
+            if not context:
+                yield {"event": "sources", "data": []}
+                yield {"event": "token", "data": {"text": "I found matches, but they did not contain readable text content."}}
+                yield {"event": "done", "data": {}}
+                return
+
+            yield {"event": "sources", "data": state.get("sources", [])}
+
+            streamed_any = False
+            for chunk in self._answer_chain.stream({"question": question, "context": context}):
+                text = getattr(chunk, "content", "") or ""
+                if text:
+                    streamed_any = True
+                    yield {"event": "token", "data": {"text": text}}
+
+            if not streamed_any:
+                yield {"event": "token", "data": {"text": "I could not generate a response."}}
+
+            yield {"event": "done", "data": {}}
+
+        except Exception as e:
+            logger.error(f"[STREAM] failed: {e}")
+            yield {
+                "event": "error",
+                "data": {
+                    "detail": (
+                        "The AI model is currently unavailable, so I can't process your "
+                        "question right now. Please try again in a moment."
+                    )
+                },
+            }
+
     def _build_graph(self):
         graph = StateGraph(ChatState)
         graph.add_node("classify_intent", self._classify_intent_node)
         graph.add_node("greeting_response", self._greeting_response_node)
         graph.add_node("out_of_domain_response", self._out_of_domain_response_node)
+        graph.add_node("service_unavailable", self._service_unavailable_node)
         graph.add_node("retrieve", self._retrieve_node)
+        graph.add_node("rerank", self._rerank_node)
         graph.add_node("build_context", self._build_context_node)
         graph.add_node("answer", self._answer_node)
-
-        # Add reranking node if enabled
-        if self._reranker and self._use_reranking:
-            graph.add_node("rerank", self._rerank_node)
-            logger.info("Reranking node added to graph")
 
         graph.set_entry_point("classify_intent")
         graph.add_conditional_edges(
@@ -415,20 +531,16 @@ class ChatService:
                 "greeting": "greeting_response",
                 "out_of_domain": "out_of_domain_response",
                 "in_domain": "retrieve",
+                "error": "service_unavailable",
                 "unknown": "out_of_domain_response",
             },
         )
 
         graph.add_edge("greeting_response", END)
         graph.add_edge("out_of_domain_response", END)
-
-        # Route through reranking if enabled
-        if self._reranker and self._use_reranking:
-            graph.add_edge("retrieve", "rerank")
-            graph.add_edge("rerank", "build_context")
-        else:
-            graph.add_edge("retrieve", "build_context")
-
+        graph.add_edge("service_unavailable", END)
+        graph.add_edge("retrieve", "rerank")
+        graph.add_edge("rerank", "build_context")
         graph.add_edge("build_context", "answer")
         graph.add_edge("answer", END)
         return graph.compile()
@@ -442,9 +554,17 @@ class ChatService:
             scores = self._intent_chain.invoke({"question": question})
             greeting_score = float(scores.greeting_score)
             out_of_domain_score = float(scores.out_of_domain_score)
+            logger.info(
+                f"[INTENT] q='{question[:60]}' greeting={greeting_score:.2f} "
+                f"out_of_domain={out_of_domain_score:.2f} "
+                f"(thresholds greeting>={self._greeting_threshold} ood>={self._out_of_domain_threshold})"
+            )
         except Exception as e:
-            logger.warning(f"Intent classification failed, defaulting to safe fallback response: {e}")
-            return {"intent": "unknown", "greeting_score": 0.0, "out_of_domain_score": 0.0}
+            # The classifier LLM (and its fallback) failed — this is a service
+            # outage, NOT an off-topic question. Route to a clear "unavailable"
+            # message instead of the misleading out-of-domain reply.
+            logger.warning(f"Intent classification failed (model/service unavailable): {e}")
+            return {"intent": "error", "greeting_score": 0.0, "out_of_domain_score": 0.0}
 
         if greeting_score >= self._greeting_threshold:
             return {
@@ -490,20 +610,32 @@ class ChatService:
             "sources": [],
         }
 
+    @staticmethod
+    def _service_unavailable_node(_: ChatState) -> ChatState:
+        return {
+            "answer": (
+                "The AI model is currently unavailable, so I can't process your question right "
+                "now. Please try again in a moment."
+            ),
+            "sources": [],
+        }
+
     def _retrieve_node(self, state: ChatState) -> ChatState:
         question = (state.get("question") or "").strip()
         if not question:
             return {"retrieved": []}
 
+        mode = state.get("mode", "normal")
         top_k = int(state.get("top_k", 5))
         top_k = max(1, min(top_k, 20))
-        fetch_k = self._retrieval_k if self._use_reranking else top_k * 2
+        use_reranking = mode in ("thinking", "advanced") and self._reranker is not None
+        use_multi_query = mode in ("thinking", "advanced") and self._multi_query_chain is not None
+        fetch_k = self._retrieval_k if use_reranking else top_k * 2
 
-        logger.info(f"[RETRIEVE] question='{question}' fetch_k={fetch_k} reranking={self._use_reranking} hybrid={self._use_hybrid_search}")
+        logger.info(f"[RETRIEVE] question='{question}' mode={mode} fetch_k={fetch_k} reranking={use_reranking} multi_query={use_multi_query}")
 
-        # Step 1: Build query list — start with original, expand via multi-query
         queries = [question]
-        if self._multi_query_chain and self._use_multi_query:
+        if use_multi_query:
             try:
                 queries = self._expand_queries(question)
                 logger.info(f"[MULTI-QUERY] {len(queries)} queries total:")
@@ -533,10 +665,24 @@ class ChatService:
                     seen[key] = (doc, score)
 
         retrieved = list(seen.values())
-        logger.info(f"[RETRIEVE] {len(retrieved)} unique docs after dedup")
+        logger.info(f"[RETRIEVE] {len(retrieved)} unique docs after content dedup")
+
+        # Cap chunks per source so one document doesn't dominate the context
+        max_per_source = int(os.getenv("MAX_CHUNKS_PER_SOURCE", "2"))
+        if max_per_source > 0:
+            source_counts: dict[str, int] = {}
+            capped: list[tuple[Document, float]] = []
+            for doc, score in sorted(retrieved, key=lambda x: x[1], reverse=True):
+                src = str((doc.metadata or {}).get("source") or (doc.metadata or {}).get("source_url") or "unknown")
+                source_counts[src] = source_counts.get(src, 0) + 1
+                if source_counts[src] <= max_per_source:
+                    capped.append((doc, score))
+            if len(capped) < len(retrieved):
+                logger.info(f"[RETRIEVE] capped {len(retrieved)}→{len(capped)} docs (max {max_per_source}/source)")
+            retrieved = capped
 
         # Step 4: BM25 hybrid re-scoring — combine dense scores with keyword scores
-        if self._use_hybrid_search and retrieved:
+        if retrieved:
             retrieved = self._apply_bm25_fusion(question, retrieved)
             logger.info(f"[BM25] top-3 fused scores: {[round(s,3) for _,s in retrieved[:5]]}")
 
@@ -616,8 +762,8 @@ class ChatService:
             return retrieved
 
     def _rerank_node(self, state: ChatState) -> ChatState:
-        """Rerank retrieved documents for better precision."""
-        if not self._reranker or not self._use_reranking:
+        mode = state.get("mode", "normal")
+        if mode == "normal" or not self._reranker:
             return state
 
         retrieved = state.get("retrieved", [])
@@ -679,8 +825,9 @@ class ChatService:
             return {"answer": "I found matches, but they did not contain readable text content."}
 
         question = state.get("question", "")
+        mode = state.get("mode", "normal")
 
-        if self._use_ensemble and self._ensemble is not None:
+        if mode == "advanced" and self._ensemble is not None:
             logger.info(f"[ANSWER] using ensemble path for: '{question[:80]}'")
             try:
                 result: EnsembleResult = self._ensemble.run_sync(question, context)
