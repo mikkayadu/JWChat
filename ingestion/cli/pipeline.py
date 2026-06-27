@@ -285,7 +285,7 @@ def _sync_pdf(source: str):
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/embedding-001"),
+        model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
     )
     client = init_collection()
     upsert_embeddings(embedded, client)
@@ -309,7 +309,7 @@ def _sync_html(url: str):
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/embedding-001"),
+        model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
     )
     client = init_collection()
     upsert_embeddings(embedded, client)
@@ -332,7 +332,7 @@ def _sync_video(source: str, model_size: str = "base"):
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/embedding-001"),
+        model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
     )
     client = init_collection()
     upsert_embeddings(embedded, client)

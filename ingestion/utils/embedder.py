@@ -72,7 +72,7 @@ def normalize_vector_dimensions(vector: list[float], target_dim: int) -> list[fl
 def embed_chunks(
     chunks: list[TextChunk],
     api_key: str | None = None,
-    model: str = "models/embedding-001",
+    model: str = "models/gemini-embedding-001",
     batch_size: int = 100,
 ) -> list[dict]:
     """

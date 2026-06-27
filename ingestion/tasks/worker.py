@@ -81,7 +81,7 @@ def _embed_and_store(chunks):
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/embedding-001"),
+        model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
     )
     client = _get_vector_client()
     upsert_embeddings(embedded, client, os.getenv("PINECONE_INDEX", "website-rag"))
