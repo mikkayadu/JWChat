@@ -1,0 +1,27 @@
+name: Keep Render backend awake
+
+# Render's free tier spins a service down after ~15 min of inactivity.
+# This pings /health every 10 min so the backend stays warm.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # every 10 minutes (UTC)
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend health endpoint
+        run: |
+          echo "Pinging $URL"
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 --retry 3 --retry-delay 30 "$URL")
+          echo "HTTP $code"
+          if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+            echo "Backend is awake."
+          else
+            echo "Unexpected status $code"
+            exit 1
+          fi
+        env:
+          URL: https://jwchat.onrender.com/health
