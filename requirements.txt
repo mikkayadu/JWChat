@@ -8,6 +8,8 @@ lxml
 langchain
 langchain-core
 langchain-google-genai
+langchain-ollama
+langchain-groq
 langchain-text-splitters
 langchain-community
 langchain-pinecone
