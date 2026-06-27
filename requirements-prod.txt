@@ -1,0 +1,27 @@
+# Production/runtime dependencies for the API server (api.app:app).
+# Excludes ingestion-only packages: playwright, openai-whisper, yt-dlp,
+# pymupdf, pytesseract. See requirements.txt for the full local set.
+beautifulsoup4
+celery
+fastapi
+google-generativeai
+httpx
+loguru
+lxml
+langchain
+langchain-core
+langchain-google-genai
+langchain-ollama
+langchain-groq
+langchain-text-splitters
+langchain-community
+langchain-pinecone
+langchain-experimental
+langgraph
+pinecone
+pydantic
+python-dotenv
+redis
+tiktoken
+uvicorn[standard]
+rank-bm25
