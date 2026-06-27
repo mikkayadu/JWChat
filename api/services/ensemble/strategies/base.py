@@ -11,8 +11,8 @@ answer) would skew that comparison.
 import time
 from abc import ABC, abstractmethod
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
 from loguru import logger
 
 # Mirrors the citation/context-only rules baked into ChatService._answer_prompt
@@ -65,7 +65,7 @@ class ReasoningStrategy(ABC):
 
     name: str = "strategy"
 
-    def __init__(self, llm: ChatGoogleGenerativeAI) -> None:
+    def __init__(self, llm: BaseChatModel) -> None:
         self._llm = llm
         self._call_count = 0
 
@@ -85,7 +85,7 @@ class ReasoningStrategy(ABC):
         Pass ``temperature`` to sample this particular call differently from
         the strategy's base LLM (e.g. higher temperature to generate diverse
         reasoning branches, then 0 to score them deterministically) without
-        needing a separate ``ChatGoogleGenerativeAI`` instance per setting.
+        needing a separate ``BaseChatModel`` instance per setting.
         Also tracks the call for the strategy's ``[ENSEMBLE:{name}]`` log line.
         """
         self._call_count += 1
