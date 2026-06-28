@@ -1,27 +1,36 @@
 # Production/runtime dependencies for the API server (api.app:app).
 # Excludes ingestion-only packages: playwright, openai-whisper, yt-dlp,
 # pymupdf, pytesseract. See requirements.txt for the full local set.
-beautifulsoup4
-celery
-fastapi
-google-generativeai
-httpx
-loguru
-lxml
-langchain
-langchain-core
-langchain-google-genai
-langchain-ollama
-langchain-groq
-langchain-text-splitters
-langchain-community
-langchain-pinecone
-langchain-experimental
-langgraph
-pinecone
-pydantic
-python-dotenv
-redis
-tiktoken
-uvicorn[standard]
-rank-bm25
+#
+# Versions are pinned to the known-good set from the local .venv. Pinning is
+# required: with unpinned langchain-* + google-* packages, pip's resolver
+# backtracks endlessly and fails with `resolution-too-deep`.
+#
+# Removed vs. the old unpinned list:
+#   - langchain-community     : not imported; code avoids it (Pydantic V1 is
+#                               incompatible with Python 3.14+, see chat_service.py)
+#   - langchain-experimental  : ingestion-only (chunker.py), not used by the API
+#   - langchain-pinecone      : optional rerank path with a runtime fallback;
+#                               not installed locally. Re-add pinned if you want it.
+
+beautifulsoup4==4.14.3
+celery==5.6.3
+fastapi==0.135.3
+google-generativeai==0.8.6
+httpx==0.28.1
+loguru==0.7.3
+lxml==6.0.2
+langchain==1.2.15
+langchain-core==1.4.8
+langchain-google-genai==4.2.1
+langchain-ollama==1.1.0
+langchain-groq==1.1.3
+langchain-text-splitters==1.1.1
+langgraph==1.1.6
+pinecone==8.1.1
+pydantic==2.12.5
+python-dotenv==1.2.2
+redis==7.4.0
+tiktoken==0.12.0
+uvicorn[standard]==0.44.0
+rank-bm25==0.2.2
