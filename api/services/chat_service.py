@@ -194,6 +194,7 @@ class ChatService:
 "supports.\n"
 "- When several sources support one point, list them together: [1][3].\n"
 "- Only cite sources you actually drew the claim from.\n"
+"- Do not append a list of the sources at the end of your response.\n"
                     
                     
                 ),

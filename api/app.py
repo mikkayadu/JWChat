@@ -126,6 +126,34 @@ def scripture(
     return ScriptureResponse(reference=reference, url=url, verses=[VerseItem(**v) for v in verses])
 
 
+_og_image_cache: dict[str, str | None] = {}
+
+@app.get("/api/og-image")
+def og_image(url: str) -> dict[str, str | None]:
+    if url in _og_image_cache:
+        return {"image": _og_image_cache[url]}
+
+    image_url: str | None = None
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=8, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; JWChat/1.0)",
+        })
+        resp.raise_for_status()
+        html = resp.text
+
+        import re
+        match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if not match:
+            match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html, re.IGNORECASE)
+        if match:
+            image_url = match.group(1)
+    except Exception:
+        pass
+
+    _og_image_cache[url] = image_url
+    return {"image": image_url}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     try:
