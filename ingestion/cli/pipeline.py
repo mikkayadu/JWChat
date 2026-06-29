@@ -189,7 +189,10 @@ def ingest_video_urls(urls_file: str, model_size: str = "base", sync: bool = Fal
 
 
 def ingest_html_urls(urls_file: str, sync: bool = False) -> int:
+    from ingestion.extractors.crawler import _is_excluded_url
+
     urls = _read_lines(urls_file)
+    urls = [u for u in urls if not _is_excluded_url(u)]
     logger.info(f"Ingesting {len(urls)} HTML page URLs from {urls_file}")
     for url in urls:
         if sync:
@@ -231,7 +234,13 @@ def ingest_video_directory(directory: str, model_size: str = "base", sync: bool 
 
 
 def _ingest_discovered_urls(urls: list[str], sync: bool = False, whisper_model: str = "base") -> int:
-    from ingestion.extractors.crawler import MEDIA_EXTENSIONS
+    from ingestion.extractors.crawler import MEDIA_EXTENSIONS, _is_excluded_url
+
+    before = len(urls)
+    urls = [u for u in urls if not _is_excluded_url(u)]
+    skipped = before - len(urls)
+    if skipped:
+        logger.info(f"[FILTER] skipped {skipped} excluded URLs (e.g. Bible pages)")
 
     pdf_urls = [u for u in urls if u.lower().endswith(".pdf")]
     video_urls = [u for u in urls if u.lower().endswith((".mp4", ".mp3", ".wav", ".m4a", ".webm", ".ogg"))]
