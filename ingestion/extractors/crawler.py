@@ -50,6 +50,17 @@ SKIP_EXTENSIONS = {
     ".zip", ".tar", ".gz", ".exe", ".dmg",
 }
 
+# URL path segments to exclude from ingestion. Any URL whose path contains
+# one of these substrings is silently skipped during crawl and ingestion.
+EXCLUDED_PATH_PATTERNS = [
+    "/library/bible/",
+]
+
+
+def _is_excluded_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(pattern in path for pattern in EXCLUDED_PATH_PATTERNS)
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -95,6 +106,10 @@ def crawl_site(
         # Skip if robots.txt disallows it
         if _is_disallowed(url, disallowed):
             logger.debug(f"  Skipped (robots.txt): {url}")
+            continue
+
+        if _is_excluded_url(url):
+            logger.debug(f"  Skipped (excluded path): {url}")
             continue
 
         # Media files — add to found list but don't crawl into them
