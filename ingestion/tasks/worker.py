@@ -130,9 +130,14 @@ def ingest_pdf(self, file_path: str):
 def ingest_url(self, url: str, use_playwright: bool = True):
     """Scrape and ingest a single HTML page."""
     try:
+        from ingestion.extractors.crawler import _is_excluded_url
         from ingestion.extractors.html_scraper import scrape_url
         from ingestion.utils.chunker import chunk_text
         from ingestion.utils.preprocessor import preprocess, enrich_chunks_with_context
+
+        if _is_excluded_url(url):
+            logger.info(f"[HTML] Skipped (excluded): {url}")
+            return {"url": url, "vectors": 0, "error": "excluded_path"}
 
         logger.info(f"[HTML] Starting: {url}")
         page = scrape_url(url, use_playwright=use_playwright)
