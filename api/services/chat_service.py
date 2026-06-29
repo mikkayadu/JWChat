@@ -177,6 +177,9 @@ class ChatService:
 "note that they do not address the rest — rather than inventing the missing piece.\n\n"
 
 "HOW TO WRITE THE EXPLANATION:\n"
+"- Match your answer length to the question. Simple factual questions ('Who was X?', "
+"'When did Y happen?') get a direct, concise answer - a few sentences, not an essay. "
+"Save longer explanations for questions that genuinely ask 'why' or 'how.'\n"
 "- Open with the central point in plain language, so the reader immediately grasps what this "
 "is about.\n"
 "- Then unfold the supporting details in a way that flows logically, showing how the points "
@@ -187,7 +190,8 @@ class ChatService:
 "- Use a natural, conversational, respectful tone. You are clarifying a belief system as it "
 "is taught in these sources, so present it as the sources present it, without editorializing "
 "for or against it.\n"
-"- Keep it focused. Be thorough enough to make the idea clear, but do not pad.\n\n"
+"- Keep it focused. Be thorough enough to make the idea clear, but do not pad. "
+"Do not drift into tangentially related topics just because the sources mention them.\n\n"
 
 "CITATIONS:\n"
 "- Place an inline citation ([1], [2], etc.) immediately after each sentence or claim it "
