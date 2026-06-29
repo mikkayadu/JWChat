@@ -81,7 +81,7 @@ def home() -> FileResponse:
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
