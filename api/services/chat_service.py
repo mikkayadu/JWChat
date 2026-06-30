@@ -289,20 +289,34 @@ class ChatService:
         answer_llm = primary_llm.with_fallbacks(fallback_llms) if fallback_llms else primary_llm
         self._answer_chain = self._answer_prompt | answer_llm
 
-        intent_runnable = primary_llm.with_structured_output(IntentScores)
-        if fallback_llms:
+        # Intent classification uses its own provider/fallback chain, independent
+        # of LLM_PROVIDER — see _init_intent_llm for why.
+        self._intent_fallback_descs: list[str] = []
+        intent_primary_llm = self._init_intent_llm()
+        intent_fallback_llms = self._init_fallback_llms(
+            spec_env="INTENT_FALLBACKS",
+            legacy=False,
+            descs=self._intent_fallback_descs,
+        )
+        intent_runnable = intent_primary_llm.with_structured_output(IntentScores)
+        if intent_fallback_llms:
             intent_runnable = intent_runnable.with_fallbacks(
-                [fb.with_structured_output(IntentScores) for fb in fallback_llms]
+                [fb.with_structured_output(IntentScores) for fb in intent_fallback_llms]
             )
         self._intent_chain = self._intent_prompt | intent_runnable
 
         self._graph = self._build_graph()
 
         fallback_desc = " → ".join(self._fallback_descs) if self._fallback_descs else "none"
+        intent_fallback_desc = (
+            " → ".join(self._intent_fallback_descs) if self._intent_fallback_descs else "none"
+        )
         logger.info(
             f"[CHATSERVICE] ready | llm_provider={self._llm_provider} "
             f"model={self._chat_model or '(provider default)'} "
             f"fallbacks=[{fallback_desc}] "
+            f"intent_provider={os.getenv('INTENT_LLM_PROVIDER', 'google')} "
+            f"intent_fallbacks=[{intent_fallback_desc}] "
             f"embeddings_provider={self._embeddings_provider} "
             f"hybrid={self._use_hybrid_search} rerank={self._use_reranking} "
             f"hyde={self._use_hyde} multi_query={self._use_multi_query} "
@@ -360,21 +374,31 @@ class ChatService:
             logger.warning(f"Failed to initialize multi-query LLM: {e}")
             return None
 
-    def _init_fallback_llms(self) -> list[BaseChatModel]:
+    def _init_fallback_llms(
+        self,
+        spec_env: str = "FALLBACKS",
+        *,
+        legacy: bool = True,
+        descs: list[str] | None = None,
+    ) -> list[BaseChatModel]:
         """Build an ordered list of fallback chat models, tried in sequence.
 
-        Configured via ``FALLBACKS`` — a comma-separated list of ``provider:model``
+        Configured via ``spec_env`` — a comma-separated list of ``provider:model``
         entries, e.g. ``groq:llama-3.1-8b-instant,groq:llama-3.3-70b-versatile``.
         Each entry is split on the FIRST colon only, because model names may
         themselves contain ':' (e.g. ollama ``qwen2.5:1.5b``). A bare ``provider``
         (no colon) uses that provider's default model.
 
-        Falls back to the legacy single ``FALLBACK_LLM_PROVIDER`` /
-        ``FALLBACK_CHAT_MODEL`` pair when ``FALLBACKS`` is unset. Entries that fail
-        to construct are skipped (logged) so one bad provider can't break startup.
+        When ``legacy`` is True and ``spec_env`` is unset, falls back to the
+        legacy single ``FALLBACK_LLM_PROVIDER`` / ``FALLBACK_CHAT_MODEL`` pair.
+        Entries that fail to construct are skipped (logged) so one bad provider
+        can't break startup. Descriptions are appended to ``descs`` (defaults to
+        ``self._fallback_descs``) for the startup log line.
         """
+        target_descs = descs if descs is not None else self._fallback_descs
+
         specs: list[tuple[str, str | None]] = []
-        raw = os.getenv("FALLBACKS", "").strip()
+        raw = os.getenv(spec_env, "").strip()
         if raw:
             for entry in raw.split(","):
                 entry = entry.strip()
@@ -382,7 +406,7 @@ class ChatService:
                     continue
                 provider, _, model = entry.partition(":")  # split on first ':' only
                 specs.append((provider.strip(), model.strip() or None))
-        elif os.getenv("FALLBACK_LLM_PROVIDER"):  # legacy single-fallback config
+        elif legacy and os.getenv("FALLBACK_LLM_PROVIDER"):  # legacy single-fallback config
             specs.append((os.getenv("FALLBACK_LLM_PROVIDER"), os.getenv("FALLBACK_CHAT_MODEL")))
 
         fallbacks: list[BaseChatModel] = []
@@ -390,13 +414,35 @@ class ChatService:
             try:
                 fallbacks.append(ModelFactory.create_llm(provider, model=model, temperature=0))
                 desc = f"{provider}:{model or '(default)'}"
-                self._fallback_descs.append(desc)
-                logger.info(f"[CHATSERVICE] fallback registered | {desc}")
+                target_descs.append(desc)
+                logger.info(f"[CHATSERVICE] {spec_env} entry registered | {desc}")
             except Exception as e:
                 logger.warning(
-                    f"Fallback init failed (provider={provider} model={model}): {e} — skipping"
+                    f"{spec_env} entry init failed (provider={provider} model={model}): {e} — skipping"
                 )
         return fallbacks
+
+    def _init_intent_llm(self) -> BaseChatModel:
+        """Build the primary LLM for intent classification.
+
+        Deliberately decoupled from ``LLM_PROVIDER`` (the answer-generation
+        backend): classification is a single structured-output call that needs
+        reliable instruction-following on a nuanced multi-criteria prompt, which
+        small/local models (e.g. Ollama) often get wrong — scoring legitimate
+        in-domain questions (e.g. "who was Abraham's wife") as out-of-domain.
+        Defaults to Google Gemini, which handles this prompt reliably regardless
+        of which provider ends up answering the question.
+        """
+        provider = os.getenv("INTENT_LLM_PROVIDER", "google")
+        model = os.getenv("INTENT_CHAT_MODEL")
+        try:
+            return ModelFactory.create_llm(provider, model=model, temperature=0)
+        except Exception as e:
+            logger.warning(
+                f"Intent classifier provider '{provider}' failed to init: {e} — "
+                f"falling back to main LLM_PROVIDER ('{self._llm_provider}')"
+            )
+            return ModelFactory.create_llm(self._llm_provider, model=self._chat_model, temperature=0)
 
     def _init_ensemble(self, llm: BaseChatModel) -> RAGEnsemble | None:
         """Parse ENSEMBLE_STRATEGIES, instantiate strategy objects, build the orchestrator."""
