@@ -39,6 +39,25 @@ except ImportError:
     logger.warning("HyDE query transformation not available.")
 
 
+# Hosted models like to sprinkle "smart" typography into their prose, and some of
+# it silently breaks the frontend's parsers: MessageBubble's scripture regex only
+# accepts [-] or [–] in a verse range, so a non-breaking hyphen turns
+# "Ecclesiastes 9:5-6" into a link to verse 5 alone, and a zero-width space
+# (which JS \s does NOT match) splits a reference in half. Fold only the
+# characters that break parsing - curly quotes and em/en dashes are legitimate
+# typography and render fine, so they are left alone.
+_TEXT_NORMALIZATION = {
+    0x200B: None,  # zero-width space
+    0x200C: None,  # zero-width non-joiner
+    0x200D: None,  # zero-width joiner
+    0xFEFF: None,  # zero-width no-break space (BOM)
+    0x00A0: " ",   # no-break space
+    0x202F: " ",   # narrow no-break space
+    0x2009: " ",   # thin space
+    0x2011: "-",   # non-breaking hyphen
+}
+
+
 class SourcePayload(TypedDict):
     source: str
     score: float
@@ -384,7 +403,7 @@ class ChatService:
         """Build an ordered list of fallback chat models, tried in sequence.
 
         Configured via ``spec_env`` — a comma-separated list of ``provider:model``
-        entries, e.g. ``groq:llama-3.1-8b-instant,groq:llama-3.3-70b-versatile``.
+        entries, e.g. ``groq:openai/gpt-oss-20b,groq:qwen/qwen3.8-27b``.
         Each entry is split on the FIRST colon only, because model names may
         themselves contain ':' (e.g. ollama ``qwen2.5:1.5b``). A bare ``provider``
         (no colon) uses that provider's default model.
@@ -544,7 +563,7 @@ class ChatService:
                 text = getattr(chunk, "content", "") or ""
                 if text:
                     streamed_any = True
-                    yield {"event": "token", "data": {"text": text}}
+                    yield {"event": "token", "data": {"text": self._normalize_answer_text(text)}}
 
             if not streamed_any:
                 yield {"event": "token", "data": {"text": "I could not generate a response."}}
@@ -934,10 +953,19 @@ class ChatService:
         logger.info(f"[ANSWER] using single-shot path for: '{question[:80]}'")
         return {"answer": self._single_shot_answer(question, context)}
 
+    @staticmethod
+    def _normalize_answer_text(text: str) -> str:
+        """Fold model typography that would break the frontend's parsers.
+
+        Safe to apply per-chunk while streaming: every mapping is a single
+        codepoint, so no substitution can straddle a chunk boundary.
+        """
+        return text.translate(_TEXT_NORMALIZATION)
+
     def _single_shot_answer(self, question: str, context: str) -> str:
         response = self._answer_chain.invoke({"question": question, "context": context})
         answer_text = (getattr(response, "content", "") or str(response)).strip()
-        return answer_text or "I could not generate a response."
+        return self._normalize_answer_text(answer_text) or "I could not generate a response."
 
     @staticmethod
     def _require_env(name: str) -> str:

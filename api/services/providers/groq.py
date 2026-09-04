@@ -2,7 +2,7 @@
 
 Importing this module registers the ``groq`` LLM builder with the factory, so
 ``groq`` can be used as a primary or fallback backend (e.g.
-``FALLBACKS=groq:llama-3.1-8b-instant,groq:llama-3.3-70b-versatile``).
+``FALLBACKS=groq:openai/gpt-oss-20b,groq:qwen/qwen3.8-27b``).
 
 Groq runs open models (Llama, Qwen, Gemma, …) on its own accelerators and exposes
 an OpenAI-compatible API, so responses are fast even on the free tier. Requires a
@@ -17,7 +17,11 @@ from langchain_groq import ChatGroq
 
 from .registry import register_llm
 
-DEFAULT_CHAT_MODEL = "llama-3.1-8b-instant"
+# Groq retires hosted models without notice (the Llama 3.x line it launched with
+# is already gone, 404ing as "model does not exist"). Keep this pointing at a
+# model the catalogue actually serves - check https://api.groq.com/openai/v1/models
+# before changing it.
+DEFAULT_CHAT_MODEL = "openai/gpt-oss-120b"
 
 
 def _resolve_api_key(explicit: str | None) -> str:
