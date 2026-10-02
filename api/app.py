@@ -14,7 +14,6 @@ import languages
 from api.services.chat_service import ChatService
 from api.services.scripture_service import (
     ScriptureNotFound,
-    chapter_url,
     get_verses,
 )
 
@@ -115,25 +114,47 @@ class ScriptureResponse(BaseModel):
     verses: list[VerseItem]
 
 
+class LanguageItem(BaseModel):
+    code: str
+    native_name: str
+    book_names: list[str]
+
+
+@app.get("/api/languages", response_model=list[LanguageItem])
+def list_languages() -> list[LanguageItem]:
+    """Enabled answer languages, with each one's 66 Bible book names (index =
+    book number - 1) so the frontend can link scripture references without
+    keeping its own book tables."""
+    return [
+        LanguageItem(code=lang.code, native_name=lang.native_name, book_names=list(lang.book_names))
+        for lang in languages.enabled()
+    ]
+
+
 @app.get("/api/scripture", response_model=ScriptureResponse)
 def scripture(
-    slug: str,
     chapter: int,
     book: int,
     verse: int,
     end_verse: int | None = None,
+    lang: str = "en",
+    slug: str | None = None,
 ) -> ScriptureResponse:
     """Fetch verse text from jw.org for inline display.
 
-    Params come pre-parsed from the frontend: `slug` (jw.org book slug),
-    `book` (1-66 book number), `chapter`, `verse`, and optional `end_verse`.
+    Params come pre-parsed from the frontend: `book` (1-66 book number),
+    `chapter`, `verse`, optional `end_verse`, and `lang` (an enabled language
+    code, default en). `slug` is accepted for older frontends but unused:
+    jw.org's finder resolves the book number in every language.
     """
     if not (1 <= book <= 66) or chapter < 1 or verse < 1:
         raise HTTPException(status_code=400, detail="Invalid scripture coordinates")
+    lang = lang.strip().lower()
+    if lang not in {enabled.code for enabled in languages.enabled()}:
+        raise HTTPException(status_code=400, detail=f"Unsupported language: {lang}")
 
-    url = chapter_url(slug, chapter)
     try:
-        verses = get_verses(slug, chapter, book, verse, end_verse)
+        url, verses = get_verses(lang, book, chapter, verse, end_verse)
     except ScriptureNotFound as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except httpx.HTTPError as e:

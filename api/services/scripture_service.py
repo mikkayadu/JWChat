@@ -1,24 +1,32 @@
 """
 Scripture lookup
 ────────────────
-Fetches Bible verse text from the public jw.org study-bible pages so the UI can
+Fetches Bible verse text from the public jw.org Bible pages so the UI can
 display a verse inline (the browser can't fetch jw.org directly — CORS).
 
-The study-bible chapter pages are server-rendered, so a plain HTTP GET +
-BeautifulSoup is enough; no headless browser is required. Each verse lives in a
-``<span class="verse" id="vBBCCCVVV">`` element whose id matches the anchor the
-frontend already computes (2-digit book, 3-digit chapter, 3-digit verse).
+Every language goes through jw.org's finder, which resolves a book number to
+that language's chapter page (``/finder?wtlocale=TW&pub=nwt&bible=43003016``
+redirects to ``/tw/nhomakorabea/bible/nwt/nhoma/yohane/3/``), so no per-language
+book slugs are needed. English uses the study Bible (``nwtsty``).
+
+The chapter pages are server-rendered, so a plain HTTP GET + BeautifulSoup is
+enough; no headless browser is required. Each verse lives in a
+``<span class="verse" id="v{book}{CCC}{VVV}">`` element; the book number is
+not zero-padded (Genesis 1:1 is ``v1001001``, John 3:16 is ``v43003016``).
 """
 
 from __future__ import annotations
 
 import re
 from functools import lru_cache
+from urllib.parse import urldefrag
 
 import httpx
 from loguru import logger
 
-_BASE = "https://www.jw.org/en/library/bible/study-bible/books"
+import languages
+
+_FINDER = "https://www.jw.org/finder"
 
 _HEADERS = {
     "User-Agent": (
@@ -43,23 +51,31 @@ class ScriptureNotFound(Exception):
     """Raised when a verse can't be located on the fetched page."""
 
 
-def chapter_url(slug: str, chapter: int) -> str:
-    return f"{_BASE}/{slug}/{chapter}/"
-
-
 def verse_anchor(book_number: int, chapter: int, verse: int) -> str:
-    return f"v{book_number:02d}{chapter:03d}{verse:03d}"
+    return f"v{book_number}{chapter:03d}{verse:03d}"
+
+
+def finder_url(lang: languages.Language, book_number: int, chapter: int, verse: int = 1) -> str:
+    bible = verse_anchor(book_number, chapter, verse)[1:]
+    return f"{_FINDER}?wtlocale={lang.jw_code}&pub={lang.bible_pub}&bible={bible}"
 
 
 @lru_cache(maxsize=256)
-def _fetch_chapter_html(slug: str, chapter: int) -> str:
-    """Fetch a chapter page. Cached — a chapter is requested repeatedly as a
-    user clicks different verses in the same passage."""
-    url = chapter_url(slug, chapter)
-    resp = httpx.get(url, headers=_HEADERS, timeout=20, follow_redirects=True)
+def _fetch_chapter(lang_code: str, book_number: int, chapter: int) -> tuple[str, str]:
+    """Fetch a chapter page through the finder; returns (final URL, html).
+    Cached — a chapter is requested repeatedly as a user clicks different
+    verses in the same passage."""
+    lang = languages.get(lang_code)
+    resp = httpx.get(
+        finder_url(lang, book_number, chapter),
+        headers=_HEADERS,
+        timeout=20,
+        follow_redirects=True,
+    )
     resp.raise_for_status()
-    # Decode from raw bytes so the page's own UTF-8 (curly quotes, NBSP) survives.
-    return resp.content.decode("utf-8", errors="replace")
+    url, _ = urldefrag(str(resp.url))
+    # Decode from raw bytes so the page's own UTF-8 (curly quotes, NBSP, ɛ/ɔ) survives.
+    return url, resp.content.decode("utf-8", errors="replace")
 
 
 def _clean_verse_text(span) -> str:
@@ -74,13 +90,14 @@ def _clean_verse_text(span) -> str:
 
 
 def get_verses(
-    slug: str,
-    chapter: int,
+    lang_code: str,
     book_number: int,
+    chapter: int,
     start_verse: int,
     end_verse: int | None = None,
-) -> list[dict]:
-    """Return ``[{"verse": int, "text": str}, ...]`` for the requested range.
+) -> tuple[str, list[dict]]:
+    """Return ``(chapter URL, [{"verse": int, "text": str}, ...])`` for the
+    requested range in ``lang_code``'s Bible.
 
     Raises ScriptureNotFound if none of the requested verses are present.
     """
@@ -90,7 +107,7 @@ def get_verses(
     if last < start_verse:
         last = start_verse
 
-    html = _fetch_chapter_html(slug, chapter)
+    url, html = _fetch_chapter(lang_code, book_number, chapter)
     soup = BeautifulSoup(html, "lxml")
 
     verses: list[dict] = []
@@ -104,7 +121,7 @@ def get_verses(
             verses.append({"verse": verse, "text": text})
 
     if not verses:
-        logger.warning(f"No verse text found for {slug} {chapter}:{start_verse} ({anchor})")
-        raise ScriptureNotFound(f"Verse not found: {slug} {chapter}:{start_verse}")
+        logger.warning(f"No verse text found for {lang_code} {book_number} {chapter}:{start_verse} ({anchor})")
+        raise ScriptureNotFound(f"Verse not found: book {book_number} {chapter}:{start_verse}")
 
-    return verses
+    return url, verses
