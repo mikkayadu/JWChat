@@ -198,10 +198,15 @@ def upsert_embeddings(
     client,
     collection_name: str = "website-rag",
     batch_size: int = 100,
+    language: str = "en",
 ):
     """
-    Upsert embedded chunks into Pinecone.
+    Upsert embedded chunks into Pinecone, into ``language``'s namespace.
+    Every vector's metadata also records its ``language``.
     """
+    import languages
+
+    lang = languages.get(language)
     if not embedded:
         logger.warning("No embedded chunks to upsert")
         return
@@ -219,7 +224,13 @@ def upsert_embeddings(
         logger.warning("No valid embedded chunks to upsert after quality filter")
         return
 
-    logger.info(f"Upserting {len(filtered_embedded)} vectors into Pinecone...")
+    logger.info(
+        f"Upserting {len(filtered_embedded)} vectors into Pinecone "
+        f"(language={lang.code}, namespace='{lang.namespace}')..."
+    )
+    # English stays in the legacy default namespace: omit the kwarg rather than
+    # pass "" so the existing upsert call is unchanged for it.
+    namespace_kwargs = {"namespace": lang.namespace} if lang.namespace else {}
 
     for i in range(0, len(filtered_embedded), batch_size):
         batch = filtered_embedded[i : i + batch_size]
@@ -238,11 +249,12 @@ def upsert_embeddings(
                 "text": _normalize_metadata_text(chunk.text),
                 "source": chunk.source,
                 **chunk.metadata,
+                "language": lang.code,
             }
 
             vectors.append({"id": point_id, "values": vector, "metadata": metadata})
 
-        client.upsert(vectors=vectors)
+        client.upsert(vectors=vectors, **namespace_kwargs)
         logger.debug(f"Upserted batch {i // batch_size + 1} ({len(batch)} points)")
 
     logger.success(f"Done: {len(filtered_embedded)} vectors in '{collection_name}'")

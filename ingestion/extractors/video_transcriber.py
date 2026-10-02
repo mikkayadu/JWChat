@@ -112,14 +112,23 @@ def transcribe_url(url: str, model_size: str = "base") -> TranscribedVideo | Non
                         source=url,
                         title=jworg["title"] or _title_from_url(url),
                         transcript=transcript,
-                        language=url.split("/")[3] if "//" in url else "en",
+                        language=jworg["language"],
                         duration_seconds=jworg["duration"],
                         metadata={
                             "source_url": url,
                             "transcript_source": "vtt",
                             "file_type": "video",
+                            "language": jworg["language"],
                         },
                     )
+
+            # Whisper has no model for some languages (e.g. Twi) and would
+            # produce a garbage transcript, so those videos need VTT subtitles.
+            if not jworg["whisper"]:
+                logger.warning(
+                    f"[JW.org] No VTT and Whisper doesn't support '{jworg['language']}' — skipping: {url}"
+                )
+                return None
 
             # Slow path: download smallest MP4 and run Whisper.
             if jworg.get("mp4_url"):
@@ -202,10 +211,13 @@ def _resolve_jworg_url(url: str) -> dict | None:
         "duration": seconds (float),
         "vtt_url":  subtitle/transcript URL (preferred — already plain text),
         "mp4_url":  lowest-quality MP4 URL (fallback for Whisper),
+        "language": registry language code (or the raw locale if unregistered),
+        "whisper":  whether Whisper can transcribe this language,
     } or None.
     """
     import re
     from urllib.parse import urlparse
+    import languages
 
     parsed = urlparse(url)
     if "jw.org" not in (parsed.netloc or ""):
@@ -217,8 +229,14 @@ def _resolve_jworg_url(url: str) -> dict | None:
         return None
 
     lang_slug, pub_id = match.group(1), match.group(2)
-    # Mediator API uses single uppercase letter: "en" → "E", "es" → "S", etc.
-    api_lang = lang_slug[:1].upper()
+    # Mediator API uses jw.org's own language codes ("en" → "E", "tw" → "TW",
+    # "es" → "S"), which are not derivable from the locale, so registered
+    # languages take theirs from the registry. Unregistered locales fall back
+    # to the first letter, which is right for some (en, fr, de) but not all.
+    lang = languages.from_jw_locale(lang_slug)
+    api_lang = lang.jw_code if lang else lang_slug[:1].upper()
+    language_code = lang.code if lang else lang_slug
+    whisper_ok = lang.whisper if lang else True
 
     api_url = (
         f"https://b.jw-cdn.org/apis/mediator/v1/media-items"
@@ -251,7 +269,14 @@ def _resolve_jworg_url(url: str) -> dict | None:
         mp4_url = mp4s[0]["progressiveDownloadURL"] if mp4s else None
 
         if vtt_url or mp4_url:
-            return {"title": title, "duration": duration, "vtt_url": vtt_url, "mp4_url": mp4_url}
+            return {
+                "title": title,
+                "duration": duration,
+                "vtt_url": vtt_url,
+                "mp4_url": mp4_url,
+                "language": language_code,
+                "whisper": whisper_ok,
+            }
 
     except Exception as e:
         logger.warning(f"JW.org mediator API failed for {pub_id}: {e}")

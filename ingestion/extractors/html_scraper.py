@@ -69,16 +69,21 @@ _CONTENT_SELECTORS = [
 ]
 
 
-def scrape_url(url: str, use_playwright: bool = True) -> ExtractedPage | None:
+def scrape_url(
+    url: str,
+    use_playwright: bool = True,
+    language: str | None = None,
+) -> ExtractedPage | None:
     """
     Scrape a single URL and return its cleaned text content.
     Set use_playwright=False for simple static pages (faster).
+    ``language`` overrides the language inferred from the URL.
     """
     fetched = _fetch_html(url, use_playwright)
     if not fetched:
         return None
     raw_html, status_code = fetched
-    return _parse_html(raw_html, url, status_code=status_code)
+    return _parse_html(raw_html, url, status_code=status_code, language=language)
 
 
 def scrape_urls(urls: list[str], use_playwright: bool = True) -> list[ExtractedPage]:
@@ -167,9 +172,15 @@ def _decode_response_content(resp) -> str:
     return content.decode("utf-8", errors="replace")
 
 
-def _parse_html(html: str, url: str, status_code: int | None = None) -> ExtractedPage | None:
+def _parse_html(
+    html: str,
+    url: str,
+    status_code: int | None = None,
+    language: str | None = None,
+) -> ExtractedPage | None:
     """Clean and extract meaningful text from raw HTML."""
     from bs4 import BeautifulSoup
+    import languages
 
     soup = BeautifulSoup(html, "lxml")
 
@@ -225,6 +236,7 @@ def _parse_html(html: str, url: str, status_code: int | None = None) -> Extracte
             "source_url": url,
             "title": title,
             "http_status": status_code,
+            "language": languages.resolve_ingest_language(url, language).code,
         }
     )
 

@@ -32,6 +32,8 @@ from collections import deque
 from urllib.parse import urljoin, urlparse, urldefrag, parse_qsl, urlencode, urlunparse
 from loguru import logger
 
+import languages
+
 
 # File extensions we want to capture (not browse into)
 MEDIA_EXTENSIONS = {".pdf", ".mp4", ".mp3", ".wav", ".m4a", ".webm", ".ogg"}
@@ -52,14 +54,27 @@ SKIP_EXTENSIONS = {
 
 # URL path segments to exclude from ingestion. Any URL whose path contains
 # one of these substrings is silently skipped during crawl and ingestion.
-EXCLUDED_PATH_PATTERNS = [
-    "/library/bible/",
-]
+# Each language's Bible lives under a different path (en "/library/bible/",
+# tw "/nhomakorabea/bible/"), so the list is the registry's union.
+EXCLUDED_PATH_PATTERNS = list(languages.excluded_paths())
 
 
 def _is_excluded_url(url: str) -> bool:
     path = urlparse(url).path.lower()
     return any(pattern in path for pattern in EXCLUDED_PATH_PATTERNS)
+
+
+def _in_path_scope(path: str, path_prefix: str | None) -> bool:
+    """True when ``path`` lies under ``path_prefix`` (e.g. "/tw/"). The prefix
+    itself without its trailing slash ("/tw", how _normalise writes the seed)
+    also counts. No prefix means no restriction."""
+    if not path_prefix:
+        return True
+    return path == path_prefix.rstrip("/") or path.startswith(path_prefix)
+
+
+def _is_jworg_video_page(url: str) -> bool:
+    return bool(_VIDEO_PAGE_PATTERNS[0].search(url))
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -70,6 +85,7 @@ def crawl_site(
     delay: float = 0.5,
     respect_robots: bool = True,
     include_subdomains: bool = False,
+    path_prefix: str | None = None,
 ) -> list[str]:
     """
     Crawl a website starting from start_url, following all internal links.
@@ -82,6 +98,8 @@ def crawl_site(
         delay:              Seconds to wait between requests (be polite)
         respect_robots:     Whether to honour robots.txt disallow rules
         include_subdomains: Whether to follow links to subdomains
+        path_prefix:        Only follow links under this path (e.g. "/tw/"),
+                            so a language-scoped crawl stays in that language
     """
     parsed = urlparse(start_url)
     base_domain = parsed.netloc
@@ -131,7 +149,7 @@ def crawl_site(
         logger.info(f"  [{len(found)}/{max_pages}] {url}")
 
         # Extract and queue all internal links
-        links = _extract_links(html, url, base_domain, include_subdomains)
+        links = _extract_links(html, url, base_domain, include_subdomains, path_prefix)
         for link in links:
             if link not in visited:
                 queue.append(link)
@@ -253,8 +271,15 @@ def _extract_links(
     current_url: str,
     base_domain: str,
     include_subdomains: bool,
+    path_prefix: str | None = None,
 ) -> list[str]:
-    """Extract all internal links from an HTML page."""
+    """Extract all internal links from an HTML page.
+
+    With ``path_prefix`` (e.g. "/tw/"), only links under that path are kept,
+    and JW.org hash-routed video links must also carry the matching locale in
+    their fragment ("#tw/mediaitems/..."), so the crawl doesn't follow the
+    language picker into every other language.
+    """
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html, "lxml")
@@ -270,6 +295,14 @@ def _extract_links(
         if _is_video_page_url(full_url):
             # Keep the fragment — it identifies which video this is.
             # Skip the domain check: yt-dlp handles cross-domain platform URLs.
+            if path_prefix and _is_jworg_video_page(full_url):
+                parsed_video = urlparse(full_url)
+                locale = path_prefix.strip("/")
+                if not (
+                    _in_path_scope(parsed_video.path, path_prefix)
+                    and parsed_video.fragment.startswith(f"{locale}/")
+                ):
+                    continue
             links.append(full_url)
             continue
 
@@ -286,6 +319,9 @@ def _extract_links(
         else:
             if parsed.netloc != base_domain:
                 continue
+
+        if not _in_path_scope(parsed.path, path_prefix):
+            continue
 
         links.append(full_url)
 

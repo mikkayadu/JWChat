@@ -72,7 +72,7 @@ def _ttl_seconds() -> int:
     return int(os.getenv("CRAWL_JOB_TTL_SECONDS", "86400"))
 
 
-def _embed_and_store(chunks):
+def _embed_and_store(chunks, language: str = "en"):
     from ingestion.utils.embedder import embed_chunks, upsert_embeddings
 
     if not chunks:
@@ -84,18 +84,30 @@ def _embed_and_store(chunks):
         model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
     )
     client = _get_vector_client()
-    upsert_embeddings(embedded, client, os.getenv("PINECONE_INDEX", "website-rag"))
+    upsert_embeddings(
+        embedded, client, os.getenv("PINECONE_INDEX", "website-rag"), language=language
+    )
     return len(embedded)
 
 
-def _queue_media_ingestion(url: str):
+def _resolve_language(source: str, language: str | None) -> str:
+    """Language code for a document: the explicit override wins, then the
+    jw.org URL locale, then English."""
+    import languages
+
+    return languages.resolve_ingest_language(source, language).code
+
+
+def _queue_media_ingestion(url: str, language: str | None = None):
     lowered = url.lower()
     if lowered.endswith(".pdf"):
-        ingest_pdf.delay(url)
+        ingest_pdf.delay(url, language=language)
         return "pdf"
 
     if lowered.endswith((".mp4", ".mp3", ".wav", ".m4a", ".webm", ".ogg")):
-        ingest_video.delay(url, is_url=True, model_size=os.getenv("WHISPER_MODEL", "base"))
+        ingest_video.delay(
+            url, is_url=True, model_size=os.getenv("WHISPER_MODEL", "base"), language=language
+        )
         return "video"
 
     return "unknown"
@@ -104,8 +116,8 @@ def _queue_media_ingestion(url: str):
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 
 @app.task(bind=True, max_retries=3, default_retry_delay=10)
-def ingest_pdf(self, file_path: str):
-    """Ingest a single PDF file."""
+def ingest_pdf(self, file_path: str, language: str | None = None):
+    """Ingest a single PDF file. ``language`` overrides the URL's language."""
     try:
         from ingestion.extractors.pdf_extractor import extract_pdf
         from ingestion.utils.chunker import chunk_pages
@@ -117,7 +129,7 @@ def ingest_pdf(self, file_path: str):
             chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
         )
-        count = _embed_and_store(chunks)
+        count = _embed_and_store(chunks, _resolve_language(file_path, language))
         logger.success(f"[PDF] Done: {file_path} → {count} vectors")
         return {"file": file_path, "vectors": count}
 
@@ -127,8 +139,8 @@ def ingest_pdf(self, file_path: str):
 
 
 @app.task(bind=True, max_retries=3, default_retry_delay=10)
-def ingest_url(self, url: str, use_playwright: bool = True):
-    """Scrape and ingest a single HTML page."""
+def ingest_url(self, url: str, use_playwright: bool = True, language: str | None = None):
+    """Scrape and ingest a single HTML page. ``language`` overrides the URL's language."""
     try:
         from ingestion.extractors.crawler import _is_excluded_url
         from ingestion.extractors.html_scraper import scrape_url
@@ -139,8 +151,9 @@ def ingest_url(self, url: str, use_playwright: bool = True):
             logger.info(f"[HTML] Skipped (excluded): {url}")
             return {"url": url, "vectors": 0, "error": "excluded_path"}
 
-        logger.info(f"[HTML] Starting: {url}")
-        page = scrape_url(url, use_playwright=use_playwright)
+        lang = _resolve_language(url, language)
+        logger.info(f"[HTML] Starting: {url} (language={lang})")
+        page = scrape_url(url, use_playwright=use_playwright, language=lang)
         if not page:
             logger.warning(f"[HTML] Skipped: {url} (scrape failed or page deemed non-content/error)")
             return {"url": url, "vectors": 0, "error": "invalid_or_error_page"}
@@ -154,7 +167,7 @@ def ingest_url(self, url: str, use_playwright: bool = True):
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
         )
         chunks = enrich_chunks_with_context(chunks, title=page.title or url, full_text=page.text)
-        count = _embed_and_store(chunks)
+        count = _embed_and_store(chunks, lang)
         logger.success(f"[HTML] Done: {url} → {count} vectors")
         return {"url": url, "vectors": count}
 
@@ -164,8 +177,14 @@ def ingest_url(self, url: str, use_playwright: bool = True):
 
 
 @app.task(bind=True, max_retries=2, default_retry_delay=30)
-def ingest_video(self, source: str, is_url: bool = False, model_size: str = "base"):
-    """Transcribe and ingest a video file or URL."""
+def ingest_video(
+    self,
+    source: str,
+    is_url: bool = False,
+    model_size: str = "base",
+    language: str | None = None,
+):
+    """Transcribe and ingest a video file or URL. ``language`` overrides the URL's language."""
     try:
         from ingestion.utils.chunker import chunk_text
 
@@ -188,7 +207,7 @@ def ingest_video(self, source: str, is_url: bool = False, model_size: str = "bas
             chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
         )
-        count = _embed_and_store(chunks)
+        count = _embed_and_store(chunks, _resolve_language(source, language))
         logger.success(f"[VIDEO] Done: {source} → {count} vectors")
         return {"source": source, "vectors": count}
 
@@ -208,10 +227,14 @@ def crawl_and_enqueue(
     include_subdomains: bool = False,
     respect_robots: bool = True,
     use_playwright: bool = True,
+    path_prefix: str | None = None,
+    language: str | None = None,
 ):
     """
     Crawl one URL, queue ingestion for it, and fan out child crawl tasks.
     URL dedupe is atomic via Redis SADD on crawl:{job_id}:seen.
+    ``path_prefix`` (e.g. "/tw/") keeps the crawl inside one language, and
+    ``language`` overrides the language each page would get from its URL.
     """
     try:
         from urllib.parse import urlparse
@@ -242,7 +265,9 @@ def crawl_and_enqueue(
             redis_client.expire(seen_key, ttl_seconds)
             redis_client.expire(pages_key, ttl_seconds)
             redis_client.expire(failed_key, ttl_seconds)
-            ingest_video.delay(url, is_url=True, model_size=os.getenv("WHISPER_MODEL", "base"))
+            ingest_video.delay(
+                url, is_url=True, model_size=os.getenv("WHISPER_MODEL", "base"), language=language
+            )
             logger.info(f"[CRAWL] Queued video page: {url}")
             return {"url": url, "status": "queued_video_page", "type": "video"}
 
@@ -259,7 +284,7 @@ def crawl_and_enqueue(
 
         ext = _get_extension(canonical_url)
         if ext in MEDIA_EXTENSIONS:
-            media_type = _queue_media_ingestion(canonical_url)
+            media_type = _queue_media_ingestion(canonical_url, language)
             logger.info(f"[CRAWL] Queued {media_type}: {canonical_url}")
             return {"url": canonical_url, "status": "queued_media", "type": media_type}
 
@@ -289,13 +314,14 @@ def crawl_and_enqueue(
         if pages > max_pages:
             return {"url": canonical_url, "status": "max_pages_reached", "pages": pages}
 
-        ingest_url.delay(canonical_url, use_playwright=use_playwright)
+        ingest_url.delay(canonical_url, use_playwright=use_playwright, language=language)
 
         links = _extract_links(
             html,
             canonical_url,
             allowed_domain,
             include_subdomains,
+            path_prefix,
         )
 
         queued_children = 0
@@ -309,6 +335,8 @@ def crawl_and_enqueue(
                 include_subdomains=include_subdomains,
                 respect_robots=respect_robots,
                 use_playwright=use_playwright,
+                path_prefix=path_prefix,
+                language=language,
             )
             queued_children += 1
 
