@@ -51,7 +51,7 @@ _SUBQ_RE = re.compile(r"^\s*\d+[.)]\s*(.+)$", re.MULTILINE)
 class DecomposedAgent(ReasoningStrategy):
     name = "decomposed"
 
-    async def arun(self, question: str, context: str) -> str:
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
         subquestions = await self._split(question)
 
         sub_answers = await asyncio.gather(
@@ -69,7 +69,7 @@ class DecomposedAgent(ReasoningStrategy):
             f"Sub-question: {sq}\nSub-answer: {sa}"
             for sq, sa in zip(subquestions, sub_answers)
         )
-        return await self._finalize(question, context, notes=notes)
+        return await self._finalize(question, context, notes=notes, answer_language=answer_language)
 
     async def _split(self, question: str) -> list[str]:
         raw = await self._ainvoke(_SPLIT_PROMPT, {"question": question}, temperature=_TEMPERATURE)

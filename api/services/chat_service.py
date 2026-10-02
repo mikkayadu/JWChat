@@ -2,7 +2,9 @@ import os
 from typing import TypedDict, List, Tuple, Optional
 from enum import Enum
 
+import languages
 from api.services.ensemble import RAGEnsemble, STRATEGY_MAP, EnsembleResult
+from api.services.ensemble.strategies.base import language_rules
 from api.services.providers import ModelFactory
 from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -64,9 +66,22 @@ class SourcePayload(TypedDict):
     snippet: str
 
 
-class ChatResult(TypedDict):
+class ChatResult(TypedDict, total=False):
     answer: str
     sources: list[SourcePayload]
+    answer_language: str
+    used_fallback: bool
+    ensemble_metadata: dict
+
+
+class RetrievalGroup(TypedDict):
+    """Passages retrieved from one language's namespace, with the query text
+    that retrieved them. BM25 and the reranker score each group against its
+    own query, since scoring English passages against a Twi question would
+    zero their keyword overlap and force a cross-language rerank."""
+    language: str
+    query: str
+    docs: list[tuple[Document, float]]
 
 
 class ChatState(TypedDict, total=False):
@@ -84,6 +99,12 @@ class ChatState(TypedDict, total=False):
     query_variants: list[str]
     hyde_doc: str
     ensemble_metadata: dict | None
+    requested_language: str
+    detected_language: str
+    answer_language: str
+    english_query: str
+    used_fallback: bool
+    retrieval_groups: list[RetrievalGroup]
 
 
 class _PineconeInferenceReranker:
@@ -118,6 +139,17 @@ class _PineconeInferenceReranker:
 class IntentScores(BaseModel):
     greeting_score: float = Field(ge=0.0, le=1.0)
     out_of_domain_score: float = Field(ge=0.0, le=1.0)
+    # Language detection and translation ride on the classifier call that
+    # already runs for every request, so the English fallback costs no extra
+    # LLM round trip. Defaults keep a model that omits them from failing.
+    detected_language: str = Field(
+        default="",
+        description="ISO 639-1 code of the question's language, e.g. 'en' or 'tw'.",
+    )
+    english_query: str = Field(
+        default="",
+        description="The question translated into English; empty if it is already English.",
+    )
 
 
 class ChatService:
@@ -148,6 +180,11 @@ class ChatService:
         self._use_ensemble = os.getenv("USE_ENSEMBLE", "false").lower() == "true"
         self._ensemble_show_metadata = os.getenv("ENSEMBLE_SHOW_METADATA", "false").lower() == "true"
         self._ensemble_similarity_threshold = float(os.getenv("ENSEMBLE_SIMILARITY_THRESHOLD", "0.85"))
+
+        # Fall back to English sources when the answer language's own
+        # namespace returns fewer than this many passages above its min score.
+        self._fallback_min_hits = int(os.getenv("FALLBACK_MIN_HITS", "2"))
+        self._bm25_fold = languages.bm25_fold_table()
 
         # Credentials/endpoints are resolved by each provider from the environment
         # (GEMINI_API_KEY for google, OLLAMA_BASE_URL for ollama, …) so this
@@ -218,8 +255,7 @@ class ChatService:
 "- When several sources support one point, list them together: [1][3].\n"
 "- Only cite sources you actually drew the claim from.\n"
 "- Do not append a list of the sources at the end of your response.\n"
-                    
-                    
+"{language_rules}"
                 ),
                 (
                     "human",
@@ -238,12 +274,18 @@ class ChatService:
 "message on two dimensions so the system can decide how to route it.\n\n"
 
 "OUTPUT:\n"
-"Return two scores, each a float between 0 and 1:\n"
+"Return two scores, each a float between 0 and 1, plus two language fields:\n"
 "- greeting_score: how much the message is purely a greeting or social pleasantry with no "
 "information-seeking intent (e.g. 'hi', 'hello', 'thanks', 'how are you', 'good morning'). "
 "A message that greets AND asks a real question is NOT a greeting — score it low.\n"
 "- out_of_domain_score: how much the message CANNOT be answered from Jehovah's Witness "
-"publications and jw.org content. Low = answerable from those sources; high = not.\n\n"
+"publications and jw.org content. Low = answerable from those sources; high = not.\n"
+"- detected_language: the ISO 639-1 code of the language the message is written in "
+"(use 'tw' for Twi/Akan, including Twi typed without the letters ɛ and ɔ). For a message "
+"mixing languages, give the main one.\n"
+"- english_query: the message translated into natural English, for searching English "
+"documents. Keep names of people, places and Bible books recognisable. Leave it empty "
+"if the message is already in English.\n\n"
 
 "WHAT IS IN DOMAIN (out_of_domain_score should be LOW):\n"
 "The knowledge base covers a wide range of life, moral, and existential questions, not only "
@@ -269,7 +311,14 @@ class ChatService:
 "loop?').\n"
 "- Requests for personal/professional advice that the Bible does not directly speak to "
 "(e.g. medical diagnoses, legal advice, financial or tax help, tech support).\n"
-"- Tasks unrelated to the knowledge base (translation, coding, summarizing arbitrary text).\n\n"
+"- Tasks unrelated to the knowledge base (translating arbitrary text, coding, summarizing "
+"arbitrary text).\n\n"
+
+"LANGUAGE:\n"
+"Messages may be written in any language, or mix languages (e.g. Twi with English words). "
+"Score them on their substance exactly as you would the same message in English. A "
+"question asked in Twi or any other language is NOT a translation request. Greetings in "
+"other languages (e.g. 'Maakye', 'Akwaaba', 'Wo ho te sɛn?') are greetings.\n\n"
 
 "GUIDANCE:\n"
 "- The two scores are independent. A pure greeting has high greeting_score; its "
@@ -305,8 +354,20 @@ class ChatService:
         # Only build it when explicitly enabled — otherwise skip the startup cost.
         self._ensemble = self._init_ensemble(primary_llm) if self._use_ensemble else None
 
-        answer_llm = primary_llm.with_fallbacks(fallback_llms) if fallback_llms else primary_llm
-        self._answer_chain = self._answer_prompt | answer_llm
+        # One answer chain per enabled language. A language may name its own
+        # fallback chain (FALLBACKS_TW=...) so a weak fallback model that writes
+        # poor Twi is never used for Twi; otherwise it shares FALLBACKS.
+        self._answer_chains = {}
+        for lang in languages.enabled():
+            spec_env = f"FALLBACKS_{lang.code.upper()}"
+            if lang.code != languages.DEFAULT.code and os.getenv(spec_env) is not None:
+                lang_descs: list[str] = []
+                lang_fallbacks = self._init_fallback_llms(spec_env, legacy=False, descs=lang_descs)
+            else:
+                lang_fallbacks = fallback_llms
+            answer_llm = primary_llm.with_fallbacks(lang_fallbacks) if lang_fallbacks else primary_llm
+            self._answer_chains[lang.code] = self._answer_prompt | answer_llm
+        self._answer_chain = self._answer_chains[languages.DEFAULT.code]
 
         # Intent classification uses its own provider/fallback chain, independent
         # of LLM_PROVIDER — see _init_intent_llm for why.
@@ -339,7 +400,8 @@ class ChatService:
             f"embeddings_provider={self._embeddings_provider} "
             f"hybrid={self._use_hybrid_search} rerank={self._use_reranking} "
             f"hyde={self._use_hyde} multi_query={self._use_multi_query} "
-            f"ensemble={self._use_ensemble}"
+            f"ensemble={self._use_ensemble} "
+            f"languages={list(self._answer_chains)}"
         )
 
     def _init_reranker(self):
@@ -374,7 +436,10 @@ class ChatService:
             )
             hyde_prompt = PromptTemplate(
                 input_variables=["question"],
-                template="Please write a detailed passage that could answer the following question:\n{question}"
+                template=(
+                    "Please write a detailed passage that could answer the following question. "
+                    "Write it in the same language as the question.\n{question}"
+                ),
             )
             return LLMChain(llm=llm, prompt=hyde_prompt)
         except Exception as e:
@@ -493,22 +558,42 @@ class ChatService:
             similarity_threshold=self._ensemble_similarity_threshold,
         )
 
-    def ask(self, question: str, top_k: int = 5, mode: str = "normal") -> ChatResult:
-        state = self._graph.invoke({"question": question, "top_k": top_k, "mode": mode})
+    def ask(
+        self,
+        question: str,
+        top_k: int = 5,
+        mode: str = "normal",
+        language: str = "auto",
+    ) -> ChatResult:
+        state = self._graph.invoke(
+            {"question": question, "top_k": top_k, "mode": mode, "requested_language": language}
+        )
         result: ChatResult = {
             "answer": state.get("answer", "I could not generate a response."),
             "sources": state.get("sources", []),
+            "answer_language": state.get("answer_language") or languages.DEFAULT.code,
+            "used_fallback": bool(state.get("used_fallback")),
         }
         ensemble_metadata = state.get("ensemble_metadata")
         if ensemble_metadata is not None:
             result["ensemble_metadata"] = ensemble_metadata
         return result
 
-    def ask_stream(self, question: str, top_k: int = 5, mode: str = "normal"):
+    def ask_stream(
+        self,
+        question: str,
+        top_k: int = 5,
+        mode: str = "normal",
+        language: str = "auto",
+        emit_meta: bool = False,
+    ):
         """Stream a chat answer as transport-agnostic events.
 
         Yields dicts of the form ``{"event": <name>, "data": <payload>}`` where
         ``event`` is one of:
+          * ``meta``    — {"answer_language": str, "used_fallback": bool}, emitted
+                          once before ``sources``, only when ``emit_meta`` is set
+                          (so frontends that predate languages never see it)
           * ``sources`` — list[SourcePayload], emitted once before any tokens
           * ``token``   — {"text": str}, one per streamed chunk
           * ``done``    — {}, terminal success marker
@@ -519,8 +604,13 @@ class ChatService:
         path is intentionally not used here — it produces multiple candidates and
         does not stream cleanly; advanced mode degrades to a streamed single shot.
         """
+        state: ChatState = {
+            "question": question,
+            "top_k": top_k,
+            "mode": mode,
+            "requested_language": language,
+        }
         try:
-            state: ChatState = {"question": question, "top_k": top_k, "mode": mode}
             state.update(self._classify_intent_node(state))
             intent = self._route_intent(state)
 
@@ -532,34 +622,33 @@ class ChatService:
                     canned = self._service_unavailable_node(state)
                 else:
                     canned = self._out_of_domain_response_node(state)
-                yield {"event": "sources", "data": []}
-                yield {"event": "token", "data": {"text": canned["answer"]}}
-                yield {"event": "done", "data": {}}
+                yield from self._canned_events(state, canned["answer"], emit_meta)
                 return
 
             # In-domain: mirror the graph edges (retrieve → rerank → build_context).
             state.update(self._retrieve_node(state))
             state.update(self._rerank_node(state))
             state.update(self._build_context_node(state))
+            messages = self._messages(state)
 
             if not state.get("retrieved"):
                 logger.warning("[STREAM] retrieved is empty — no docs passed retrieval/filtering")
-                yield {"event": "sources", "data": []}
-                yield {"event": "token", "data": {"text": "I could not find relevant content in the indexed books yet."}}
-                yield {"event": "done", "data": {}}
+                yield from self._canned_events(state, messages.no_results, emit_meta)
                 return
 
             context = (state.get("context") or "").strip()
             if not context:
-                yield {"event": "sources", "data": []}
-                yield {"event": "token", "data": {"text": "I found matches, but they did not contain readable text content."}}
-                yield {"event": "done", "data": {}}
+                yield from self._canned_events(state, messages.no_text, emit_meta)
                 return
 
+            if emit_meta:
+                yield {"event": "meta", "data": self._meta(state)}
             yield {"event": "sources", "data": state.get("sources", [])}
 
+            answer_language = state.get("answer_language") or languages.DEFAULT.code
+            chain = self._answer_chains.get(answer_language, self._answer_chain)
             streamed_any = False
-            for chunk in self._answer_chain.stream({"question": question, "context": context}):
+            for chunk in chain.stream(self._answer_inputs(question, context, answer_language)):
                 text = getattr(chunk, "content", "") or ""
                 if text:
                     streamed_any = True
@@ -572,15 +661,22 @@ class ChatService:
 
         except Exception as e:
             logger.error(f"[STREAM] failed: {e}")
-            yield {
-                "event": "error",
-                "data": {
-                    "detail": (
-                        "The AI model is currently unavailable, so I can't process your "
-                        "question right now. Please try again in a moment."
-                    )
-                },
-            }
+            yield {"event": "error", "data": {"detail": self._messages(state).unavailable}}
+
+    def _canned_events(self, state: ChatState, text: str, emit_meta: bool):
+        """Events for a reply that needs no LLM generation."""
+        if emit_meta:
+            yield {"event": "meta", "data": self._meta(state)}
+        yield {"event": "sources", "data": []}
+        yield {"event": "token", "data": {"text": text}}
+        yield {"event": "done", "data": {}}
+
+    @staticmethod
+    def _meta(state: ChatState) -> dict:
+        return {
+            "answer_language": state.get("answer_language") or languages.DEFAULT.code,
+            "used_fallback": bool(state.get("used_fallback")),
+        }
 
     def _build_graph(self):
         graph = StateGraph(ChatState)
@@ -617,83 +713,107 @@ class ChatService:
 
     def _classify_intent_node(self, state: ChatState) -> ChatState:
         question = (state.get("question") or "").strip()
+        requested = (state.get("requested_language") or "auto").strip().lower()
         if not question:
-            return {"intent": "greeting", "greeting_score": 1.0, "out_of_domain_score": 0.0}
+            return {
+                "intent": "greeting",
+                "greeting_score": 1.0,
+                "out_of_domain_score": 0.0,
+                **self._language_fields(requested, "", "", question),
+            }
 
         try:
             scores = self._intent_chain.invoke({"question": question})
             greeting_score = float(scores.greeting_score)
             out_of_domain_score = float(scores.out_of_domain_score)
+            lang_fields = self._language_fields(
+                requested, scores.detected_language, scores.english_query, question
+            )
             logger.info(
                 f"[INTENT] q='{question[:60]}' greeting={greeting_score:.2f} "
                 f"out_of_domain={out_of_domain_score:.2f} "
-                f"(thresholds greeting>={self._greeting_threshold} ood>={self._out_of_domain_threshold})"
+                f"(thresholds greeting>={self._greeting_threshold} ood>={self._out_of_domain_threshold}) "
+                f"language requested={requested} detected={lang_fields['detected_language'] or '?'} "
+                f"answer={lang_fields['answer_language']}"
             )
         except Exception as e:
             # The classifier LLM (and its fallback) failed — this is a service
             # outage, NOT an off-topic question. Route to a clear "unavailable"
             # message instead of the misleading out-of-domain reply.
             logger.warning(f"Intent classification failed (model/service unavailable): {e}")
-            return {"intent": "error", "greeting_score": 0.0, "out_of_domain_score": 0.0}
-
-        if greeting_score >= self._greeting_threshold:
             return {
-                "intent": "greeting",
-                "greeting_score": greeting_score,
-                "out_of_domain_score": out_of_domain_score,
+                "intent": "error",
+                "greeting_score": 0.0,
+                "out_of_domain_score": 0.0,
+                **self._language_fields(requested, "", "", question),
             }
 
-        if out_of_domain_score >= self._out_of_domain_threshold:
-            return {
-                "intent": "out_of_domain",
-                "greeting_score": greeting_score,
-                "out_of_domain_score": out_of_domain_score,
-            }
-
-        return {
-            "intent": "in_domain",
+        scores_state = {
             "greeting_score": greeting_score,
             "out_of_domain_score": out_of_domain_score,
+            **lang_fields,
         }
+
+        if greeting_score >= self._greeting_threshold:
+            return {"intent": "greeting", **scores_state}
+
+        if out_of_domain_score >= self._out_of_domain_threshold:
+            return {"intent": "out_of_domain", **scores_state}
+
+        return {"intent": "in_domain", **scores_state}
+
+    @staticmethod
+    def _language_fields(
+        requested: str, detected_raw: str, english_query: str, question: str
+    ) -> ChatState:
+        """Resolve the answer language from the picker and the detected language.
+
+        An explicit, enabled picker value always wins. "auto" uses the detected
+        language when it is enabled. Everything else (a disabled language, a
+        failed detection, a classifier outage) resolves to English. Detection
+        isn't limited to enabled languages, so a Twi question asked while Twi
+        is off still gets an English translation to search with.
+        """
+        detected = languages.normalise_code(detected_raw)
+        enabled = {lang.code for lang in languages.enabled()}
+        if requested and requested != "auto":
+            answer = requested if requested in enabled else languages.DEFAULT.code
+        else:
+            answer = detected if detected in enabled else languages.DEFAULT.code
+        return {
+            "requested_language": requested,
+            "detected_language": detected,
+            "answer_language": answer,
+            # The classifier leaves this empty for English questions.
+            "english_query": (english_query or "").strip() or question,
+        }
+
+    @staticmethod
+    def _messages(state: ChatState) -> languages.Messages:
+        """Canned replies in the request's answer language."""
+        code = state.get("answer_language") or languages.DEFAULT.code
+        return languages.LANGUAGES.get(code, languages.DEFAULT).messages
 
     @staticmethod
     def _route_intent(state: ChatState) -> str:
         return str(state.get("intent") or "unknown")
 
     @staticmethod
-    def _greeting_response_node(_: ChatState) -> ChatState:
-        return {
-            "answer": (
-                "Hello. I can help with questions based on indexed Jehovah's Witnesses content. "
-                "Ask me a question about JW teachings, publications, or material from jw.org."
-            ),
-            "sources": [],
-        }
+    def _greeting_response_node(state: ChatState) -> ChatState:
+        return {"answer": ChatService._messages(state).greeting, "sources": []}
 
     @staticmethod
-    def _out_of_domain_response_node(_: ChatState) -> ChatState:
-        return {
-            "answer": (
-                "I can only answer from indexed Jehovah's Witnesses sources. "
-                "Please ask a JW-related question so I can cite the relevant material."
-            ),
-            "sources": [],
-        }
+    def _out_of_domain_response_node(state: ChatState) -> ChatState:
+        return {"answer": ChatService._messages(state).out_of_domain, "sources": []}
 
     @staticmethod
-    def _service_unavailable_node(_: ChatState) -> ChatState:
-        return {
-            "answer": (
-                "The AI model is currently unavailable, so I can't process your question right "
-                "now. Please try again in a moment."
-            ),
-            "sources": [],
-        }
+    def _service_unavailable_node(state: ChatState) -> ChatState:
+        return {"answer": ChatService._messages(state).unavailable, "sources": []}
 
     def _retrieve_node(self, state: ChatState) -> ChatState:
         question = (state.get("question") or "").strip()
         if not question:
-            return {"retrieved": []}
+            return {"retrieved": [], "retrieval_groups": [], "used_fallback": False}
 
         mode = state.get("mode", "normal")
         top_k = int(state.get("top_k", 5))
@@ -701,34 +821,100 @@ class ChatService:
         use_reranking = mode in ("thinking", "advanced") and self._reranker is not None
         use_multi_query = mode in ("thinking", "advanced") and self._multi_query_chain is not None
         fetch_k = self._retrieval_k if use_reranking else top_k * 2
+        answer_lang = languages.LANGUAGES.get(
+            state.get("answer_language") or languages.DEFAULT.code, languages.DEFAULT
+        )
 
-        logger.info(f"[RETRIEVE] question='{question}' mode={mode} fetch_k={fetch_k} reranking={use_reranking} multi_query={use_multi_query}")
+        logger.info(
+            f"[RETRIEVE] question='{question}' mode={mode} fetch_k={fetch_k} "
+            f"reranking={use_reranking} multi_query={use_multi_query} language={answer_lang.code}"
+        )
 
-        queries = [question]
+        # Group 1: the answer language's own namespace, searched with its own text.
+        primary, hyde_doc, query_variants = self._search_group(
+            answer_lang, self._query_text_for(state, answer_lang), fetch_k, use_multi_query
+        )
+        groups = [primary]
+
+        # Group 2: English sources when the answer language's own are thin,
+        # searched with the English translation of the question.
+        used_fallback = False
+        if (
+            answer_lang.code != languages.DEFAULT.code
+            and len(primary["docs"]) < self._fallback_min_hits
+        ):
+            fallback, _, _ = self._search_group(
+                languages.DEFAULT,
+                self._query_text_for(state, languages.DEFAULT),
+                fetch_k,
+                use_multi_query,
+            )
+            groups.append(fallback)
+            used_fallback = bool(fallback["docs"])
+
+        hits = ", ".join(f"{g['language']}={len(g['docs'])}" for g in groups)
+        fallback_note = (
+            f" english_fallback={'fired' if len(groups) > 1 else 'not needed'}"
+            if answer_lang.code != languages.DEFAULT.code
+            else ""
+        )
+        logger.info(f"[RETRIEVE] hits per namespace: {hits}{fallback_note}")
+
+        return {
+            "retrieved": [pair for group in groups for pair in group["docs"]],
+            "retrieval_groups": groups,
+            "used_fallback": used_fallback,
+            "hyde_doc": hyde_doc,
+            "query_variants": query_variants,
+        }
+
+    @staticmethod
+    def _query_text_for(state: ChatState, lang: languages.Language) -> str:
+        """Text to search ``lang``'s namespace with: the question itself when
+        it is written in that language, its English translation for the
+        English namespace, else the question as-is."""
+        question = (state.get("question") or "").strip()
+        if state.get("detected_language") == lang.code:
+            return question
+        if lang.code == languages.DEFAULT.code and state.get("english_query"):
+            return state["english_query"]
+        return question
+
+    def _search_group(
+        self,
+        lang: languages.Language,
+        text: str,
+        fetch_k: int,
+        use_multi_query: bool,
+    ) -> tuple[RetrievalGroup, str | None, list[str]]:
+        """Retrieve from one language's namespace: query expansion and HyDE,
+        fetch, content dedup, per-source cap, then BM25 fusion against ``text``.
+        Returns the group plus the HyDE passage and query variants used."""
+        queries = [text]
         if use_multi_query:
             try:
-                queries = self._expand_queries(question)
+                queries = self._expand_queries(text)
                 logger.info(f"[MULTI-QUERY] {len(queries)} queries total:")
                 for i, q in enumerate(queries):
                     logger.info(f"  [{i}] {q}")
             except Exception as e:
                 logger.warning(f"Multi-query expansion failed, using original query: {e}")
 
-        # Step 2: HyDE — rewrite the primary query as a hypothetical answer passage
+        # HyDE — rewrite the primary query as a hypothetical answer passage
         hyde_doc = None
         if self._hyde_chain and self._use_hyde:
             try:
-                hyde_doc = self._hyde_chain.invoke({"question": question})["text"]
+                hyde_doc = self._hyde_chain.invoke({"question": text})["text"]
                 queries[0] = hyde_doc
                 logger.info(f"[HYDE] hypothetical passage (first 120 chars): {hyde_doc[:120]}")
             except Exception as e:
                 logger.warning(f"HyDE failed, using original query: {e}")
 
-        # Step 3: Fetch for every query variant; deduplicate by content fingerprint
+        # Fetch for every query variant; deduplicate by content fingerprint
         seen: dict[str, tuple[Document, float]] = {}
         for query in queries:
-            hits = self._fetch_from_pinecone(query, fetch_k)
-            logger.info(f"[PINECONE] query='{query[:60]}...' → {len(hits)} hits passed filter")
+            hits = self._fetch_from_pinecone(query, fetch_k, lang)
+            logger.info(f"[PINECONE] ns='{lang.namespace}' query='{query[:60]}...' → {len(hits)} hits passed filter")
             for doc, score in hits:
                 key = doc.page_content[:120]
                 if key not in seen or score > seen[key][1]:
@@ -751,33 +937,36 @@ class ChatService:
                 logger.info(f"[RETRIEVE] capped {len(retrieved)}→{len(capped)} docs (max {max_per_source}/source)")
             retrieved = capped
 
-        # Step 4: BM25 hybrid re-scoring — combine dense scores with keyword scores
+        # BM25 hybrid re-scoring — combine dense scores with keyword scores
         if retrieved:
-            retrieved = self._apply_bm25_fusion(question, retrieved)
+            retrieved = self._apply_bm25_fusion(text, retrieved)
             logger.info(f"[BM25] top-3 fused scores: {[round(s,3) for _,s in retrieved[:5]]}")
 
-        return {
-            "retrieved": retrieved,
-            "hyde_doc": hyde_doc,
-            "query_variants": queries[1:],
-        }
+        return {"language": lang.code, "query": text, "docs": retrieved}, hyde_doc, queries[1:]
 
-    def _fetch_from_pinecone(self, query: str, k: int) -> list[tuple[Document, float]]:
-        """Embed query and fetch top-k matches from Pinecone above the min score threshold."""
+    def _fetch_from_pinecone(
+        self, query: str, k: int, lang: languages.Language = languages.DEFAULT
+    ) -> list[tuple[Document, float]]:
+        """Embed query and fetch top-k matches from ``lang``'s namespace above its min score."""
         query_vector = self._embeddings.embed_query(query)
-        result = self._index.query(vector=query_vector, top_k=k, include_metadata=True)
+        # English lives in the legacy default namespace; omit the kwarg for it.
+        namespace_kwargs = {"namespace": lang.namespace} if lang.namespace else {}
+        result = self._index.query(vector=query_vector, top_k=k, include_metadata=True, **namespace_kwargs)
         matches = result.get("matches", [])
-        min_score = self._read_min_score()
+        min_score = lang.min_score if lang.min_score is not None else self._read_min_score()
 
         all_scores = [float(m.get("score") or 0.0) for m in matches]
         logger.info(f"[PINECONE RAW] {len(matches)} matches, min_score_filter={min_score}, scores={[round(s,3) for s in all_scores[:10]]}")
 
         retrieved: list[tuple[Document, float]] = []
         for match in matches:
-            metadata = match.get("metadata") or {}
+            metadata = dict(match.get("metadata") or {})
             score = float(match.get("score") or 0.0)
             if score < min_score:
                 continue
+            # Vectors ingested before languages existed carry no language tag;
+            # the namespace they came from says what it is.
+            metadata.setdefault("language", lang.code)
             retrieved.append((
                 Document(page_content=str(metadata.get("text") or ""), metadata=metadata),
                 score,
@@ -790,6 +979,7 @@ class ChatService:
             "Generate 3 different reformulations of the following question to improve document retrieval. "
             "Each reformulation should approach the topic from a different angle — "
             "one more specific, one broader, one using different terminology. "
+            "Write each reformulation in the same language as the original question. "
             "Return only the reformulations, one per line, no numbering or bullets.\n\n"
             f"Original question: {question}"
         )
@@ -814,9 +1004,11 @@ class ChatService:
             docs = [doc for doc, _ in retrieved]
 
             # Tokenise and score directly with BM25Okapi (pure Python, no Pydantic)
-            tokenized_corpus = [doc.page_content.lower().split() for doc in docs]
+            # Fold language-specific letters (ɛ→e, ɔ→o) so a question typed
+            # without them still matches passages that use them.
+            tokenized_corpus = [self._bm25_tokens(doc.page_content) for doc in docs]
             bm25 = BM25Okapi(tokenized_corpus)
-            raw_scores = bm25.get_scores(question.lower().split())
+            raw_scores = bm25.get_scores(self._bm25_tokens(question))
 
             # Normalise to [0, 1] so scores are comparable with dense cosine scores
             max_score = max(raw_scores) if max(raw_scores) > 0 else 1.0
@@ -831,24 +1023,38 @@ class ChatService:
             logger.warning(f"BM25 fusion failed, returning dense results: {e}")
             return retrieved
 
+    def _bm25_tokens(self, text: str) -> list[str]:
+        return text.lower().translate(self._bm25_fold).split()
+
     def _rerank_node(self, state: ChatState) -> ChatState:
         mode = state.get("mode", "normal")
         if mode == "normal" or not self._reranker:
             return state
 
-        retrieved = state.get("retrieved", [])
-        if not retrieved:
+        groups = state.get("retrieval_groups") or []
+        if not groups and state.get("retrieved"):
+            groups = [{
+                "language": languages.DEFAULT.code,
+                "query": state.get("question", ""),
+                "docs": state["retrieved"],
+            }]
+        if not groups:
             return state
 
         try:
-            docs = [doc for doc, score in retrieved]
-            query = state.get("question", "")
-
-            # PineconeRerank expects documents and query
-            reranked_docs = self._reranker.compress_documents(docs, query)
-
-            # Convert back to retrieved format with new scores
-            reranked = [(doc, doc.metadata.get("relevance_score", 0.0)) for doc in reranked_docs]
+            # Each group is reranked against the text that retrieved it, then
+            # the groups are concatenated, answer-language group first.
+            reranked: list[tuple[Document, float]] = []
+            for group in groups:
+                if not group["docs"]:
+                    continue
+                docs = [doc for doc, score in group["docs"]]
+                # PineconeRerank expects documents and query
+                reranked_docs = self._reranker.compress_documents(docs, group["query"])
+                # Convert back to retrieved format with new scores
+                reranked.extend(
+                    (doc, doc.metadata.get("relevance_score", 0.0)) for doc in reranked_docs
+                )
             return {"reranked_docs": reranked}
         except Exception as e:
             logger.warning(f"Reranking failed: {e}")
@@ -858,6 +1064,11 @@ class ChatService:
         # Use reranked docs if available, otherwise use retrieved
         reranked = state.get("reranked_docs")
         retrieved = reranked if reranked else state.get("retrieved", [])
+
+        # Label each passage's language when answering in a non-English
+        # language, so the model knows which passages it must translate.
+        # English context is left exactly as before.
+        label_languages = (state.get("answer_language") or languages.DEFAULT.code) != languages.DEFAULT.code
 
         sections: list[str] = []
         sources: list[SourcePayload] = []
@@ -869,7 +1080,12 @@ class ChatService:
 
             metadata = doc.metadata or {}
             source = str(metadata.get("source") or metadata.get("source_url") or "unknown")
-            sections.append(f"[{i}] Source: {source}\n{text}")
+            header = f"[{i}] Source: {source}"
+            if label_languages:
+                code = str(metadata.get("language") or "")
+                lang = languages.LANGUAGES.get(code)
+                header += f" (Language: {lang.name if lang else code or 'unknown'})"
+            sections.append(f"{header}\n{text}")
 
             snippet = text.replace("\n", " ")
             if len(snippet) > 240:
@@ -886,27 +1102,29 @@ class ChatService:
         return {"context": "\n\n".join(sections), "sources": sources}
 
     def _answer_node(self, state: ChatState) -> ChatState:
+        messages = self._messages(state)
         if not state.get("retrieved"):
             logger.warning("[ANSWER] retrieved is empty — no docs passed retrieval/filtering")
-            return {"answer": "I could not find relevant content in the indexed books yet."}
+            return {"answer": messages.no_results}
 
         context = (state.get("context") or "").strip()
         if not context:
-            return {"answer": "I found matches, but they did not contain readable text content."}
+            return {"answer": messages.no_text}
 
         question = state.get("question", "")
         mode = state.get("mode", "normal")
+        answer_language = state.get("answer_language") or languages.DEFAULT.code
 
         if mode == "advanced" and self._ensemble is not None:
-            logger.info(f"[ANSWER] using ensemble path for: '{question[:80]}'")
+            logger.info(f"[ANSWER] using ensemble path for: '{question[:80]}' language={answer_language}")
             try:
-                result: EnsembleResult = self._ensemble.run_sync(question, context)
+                result: EnsembleResult = self._ensemble.run_sync(question, context, answer_language)
                 winner = result["winner"]
                 answer_text = winner.get("answer") or ""
 
                 if not answer_text:
                     logger.warning("[ENSEMBLE] winner had no answer — falling back to single-shot")
-                    return {"answer": self._single_shot_answer(question, context)}
+                    return {"answer": self._single_shot_answer(question, context, answer_language)}
 
                 candidates = result.get("candidates", [])
                 clusters = result.get("clusters", [])
@@ -950,8 +1168,8 @@ class ChatService:
             except Exception as e:
                 logger.error(f"[ENSEMBLE] failed — falling back to single-shot answer: {e}")
 
-        logger.info(f"[ANSWER] using single-shot path for: '{question[:80]}'")
-        return {"answer": self._single_shot_answer(question, context)}
+        logger.info(f"[ANSWER] using single-shot path for: '{question[:80]}' language={answer_language}")
+        return {"answer": self._single_shot_answer(question, context, answer_language)}
 
     @staticmethod
     def _normalize_answer_text(text: str) -> str:
@@ -962,8 +1180,17 @@ class ChatService:
         """
         return text.translate(_TEXT_NORMALIZATION)
 
-    def _single_shot_answer(self, question: str, context: str) -> str:
-        response = self._answer_chain.invoke({"question": question, "context": context})
+    @staticmethod
+    def _answer_inputs(question: str, context: str, answer_language: str) -> dict:
+        return {
+            "question": question,
+            "context": context,
+            "language_rules": language_rules(answer_language),
+        }
+
+    def _single_shot_answer(self, question: str, context: str, answer_language: str = "en") -> str:
+        chain = self._answer_chains.get(answer_language, self._answer_chain)
+        response = chain.invoke(self._answer_inputs(question, context, answer_language))
         answer_text = (getattr(response, "content", "") or str(response)).strip()
         return self._normalize_answer_text(answer_text) or "I could not generate a response."
 

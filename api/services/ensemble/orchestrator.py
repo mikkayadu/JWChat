@@ -57,7 +57,7 @@ class RAGEnsemble:
         self._embeddings = embeddings
         self._similarity_threshold = similarity_threshold
 
-    async def run(self, question: str, context: str) -> EnsembleResult:
+    async def run(self, question: str, context: str, answer_language: str = "en") -> EnsembleResult:
         start = time.time()
         names = list(self._strategies.keys())
         logger.info(f"[ENSEMBLE] running {len(names)} strategies: {names}")
@@ -65,7 +65,7 @@ class RAGEnsemble:
         candidates = list(
             await asyncio.gather(
                 *(
-                    self._run_one(name, strategy, question, context)
+                    self._run_one(name, strategy, question, context, answer_language)
                     for name, strategy in self._strategies.items()
                 )
             )
@@ -90,7 +90,7 @@ class RAGEnsemble:
             "total_duration_ms": total_duration_ms,
         }
 
-    def run_sync(self, question: str, context: str) -> EnsembleResult:
+    def run_sync(self, question: str, context: str, answer_language: str = "en") -> EnsembleResult:
         """Sync entry point for the LangGraph node (which invokes synchronously).
 
         Safe to call here: ``ChatService.ask()`` is invoked from a *sync*
@@ -98,14 +98,19 @@ class RAGEnsemble:
         a worker thread with no running event loop — so ``asyncio.run`` won't
         collide with one.
         """
-        return asyncio.run(self.run(question, context))
+        return asyncio.run(self.run(question, context, answer_language))
 
     async def _run_one(
-        self, name: str, strategy: ReasoningStrategy, question: str, context: str
+        self,
+        name: str,
+        strategy: ReasoningStrategy,
+        question: str,
+        context: str,
+        answer_language: str = "en",
     ) -> StrategyResult:
         start = time.time()
         try:
-            answer = await strategy.run_logged(question, context)
+            answer = await strategy.run_logged(question, context, answer_language)
             return {
                 "strategy": name,
                 "answer": answer,

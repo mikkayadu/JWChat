@@ -8,8 +8,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+import languages
 from api.services.chat_service import ChatService
 from api.services.scripture_service import (
     ScriptureNotFound,
@@ -26,6 +27,21 @@ class ChatRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=4000)
     top_k: int = Field(default=5, ge=1, le=20)
     mode: str = Field(default="normal", pattern="^(normal|thinking|advanced)$")
+    # "auto" detects the language from the question; a code forces it. Left
+    # unset by frontends that predate languages, which then get exactly the
+    # old response stream (no `meta` event).
+    language: str | None = None
+
+    @field_validator("language")
+    @classmethod
+    def _check_language(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().lower()
+        allowed = ["auto"] + [lang.code for lang in languages.enabled()]
+        if value not in allowed:
+            raise ValueError(f"language must be one of {allowed}")
+        return value
 
 
 class SourceItem(BaseModel):
@@ -53,6 +69,8 @@ class ChatResponse(BaseModel):
     answer: str
     sources: list[SourceItem]
     ensemble_metadata: EnsembleMetadata | None = None
+    answer_language: str = "en"
+    used_fallback: bool = False
 
 
 app = FastAPI(title="Book Chatbot API", version="1.0.0")
@@ -157,12 +175,14 @@ def og_image(url: str) -> dict[str, str | None]:
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     try:
-        result = _get_chat_service().ask(req.question, req.top_k, req.mode)
+        result = _get_chat_service().ask(req.question, req.top_k, req.mode, req.language or "auto")
         ensemble_meta = result.get("ensemble_metadata")
         return ChatResponse(
             answer=result["answer"],
             sources=[SourceItem(**source) for source in result["sources"]],
             ensemble_metadata=EnsembleMetadata(**ensemble_meta) if ensemble_meta else None,
+            answer_language=result.get("answer_language", "en"),
+            used_fallback=result.get("used_fallback", False),
         )
 
     except RuntimeError as e:
@@ -181,13 +201,22 @@ def chat_stream(req: ChatRequest) -> StreamingResponse:
     """Stream the answer token-by-token over Server-Sent Events.
 
     Emits a `sources` event, then a series of `token` events, then `done`
-    (or `error`). Generation runs on the primary LLM and transparently falls
-    back to the configured backup on any failure.
+    (or `error`). When the request includes `language`, a `meta` event with
+    `answer_language` and `used_fallback` comes first. Generation runs on the
+    primary LLM and transparently falls back to the configured backup on any
+    failure.
     """
 
     def event_stream() -> Iterator[str]:
         try:
-            for event in _get_chat_service().ask_stream(req.question, req.top_k, req.mode):
+            events = _get_chat_service().ask_stream(
+                req.question,
+                req.top_k,
+                req.mode,
+                language=req.language or "auto",
+                emit_meta=req.language is not None,
+            )
+            for event in events:
                 yield _sse(event["event"], event["data"])
         except Exception as e:  # safety net — ask_stream already emits `error`
             yield _sse("error", {"detail": f"Chat request failed: {e}"})

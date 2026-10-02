@@ -49,14 +49,14 @@ _PASSAGE_HEADER_RE = re.compile(r"^\[\d+\]\s*Source:")
 class RecursiveAgent(ReasoningStrategy):
     name = "recursive"
 
-    async def arun(self, question: str, context: str) -> str:
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
         passages = [
             block.strip()
             for block in context.split("\n\n")
             if _PASSAGE_HEADER_RE.match(block.strip())
         ]
         if not passages:
-            return await self._finalize(question, context)
+            return await self._finalize(question, context, answer_language=answer_language)
 
         chunks = [
             "\n\n".join(passages[i : i + _CHUNK_SIZE])
@@ -80,7 +80,7 @@ class RecursiveAgent(ReasoningStrategy):
             pairs = [notes[i : i + 2] for i in range(0, len(notes), 2)]
             notes = list(await asyncio.gather(*(self._reduce(question, pair) for pair in pairs)))
 
-        return await self._finalize(question, context, notes=notes[0])
+        return await self._finalize(question, context, notes=notes[0], answer_language=answer_language)
 
     async def _reduce(self, question: str, pair: list[str]) -> str:
         if len(pair) == 1:

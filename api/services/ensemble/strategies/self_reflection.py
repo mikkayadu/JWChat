@@ -53,7 +53,7 @@ _CRITIQUE_PROMPT = ChatPromptTemplate.from_messages(
 class SelfReflectionAgent(ReasoningStrategy):
     name = "self_reflection"
 
-    async def arun(self, question: str, context: str) -> str:
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
         draft = await self._ainvoke(
             _DRAFT_PROMPT,
             {"question": question, "context": context},
@@ -65,4 +65,4 @@ class SelfReflectionAgent(ReasoningStrategy):
             temperature=_CRITIQUE_TEMPERATURE,
         )
         notes = f"Draft answer:\n{draft}\n\nCritique and corrections to apply:\n{critique}"
-        return await self._finalize(question, context, notes=notes)
+        return await self._finalize(question, context, notes=notes, answer_language=answer_language)

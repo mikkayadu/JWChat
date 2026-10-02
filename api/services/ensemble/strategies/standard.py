@@ -13,5 +13,5 @@ from .base import ReasoningStrategy
 class StandardAgent(ReasoningStrategy):
     name = "standard"
 
-    async def arun(self, question: str, context: str) -> str:
-        return await self._finalize(question, context)
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
+        return await self._finalize(question, context, answer_language=answer_language)

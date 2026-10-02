@@ -56,7 +56,7 @@ _SCORE_PROMPT = ChatPromptTemplate.from_messages(
 class ToTAgent(ReasoningStrategy):
     name = "tot"
 
-    async def arun(self, question: str, context: str) -> str:
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
         branches = await self._ainvoke(
             _BRANCHES_PROMPT,
             {"question": question, "context": context},
@@ -67,4 +67,4 @@ class ToTAgent(ReasoningStrategy):
             {"question": question, "context": context, "branches": branches},
             temperature=0,
         )
-        return await self._finalize(question, context, notes=best_branch)
+        return await self._finalize(question, context, notes=best_branch, answer_language=answer_language)

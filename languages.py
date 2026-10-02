@@ -43,6 +43,7 @@ class Language:
     book_names: tuple[str, ...]       # 66 NWT book names, index = book number - 1
     messages: Messages
     bm25_fold: dict[str, str] = field(default_factory=dict)  # folded before BM25 tokenising
+    aliases: tuple[str, ...] = ()     # other codes a detector may return ("ak", "twi")
 
 
 # Scraped from https://www.jw.org/en/library/bible/study-bible/books/
@@ -140,6 +141,7 @@ TWI = Language(
         ),
     ),
     bm25_fold={"ɛ": "e", "ɔ": "o", "Ɛ": "E", "Ɔ": "O"},
+    aliases=("ak", "aka", "twi", "akan"),
 )
 
 LANGUAGES: dict[str, Language] = {lang.code: lang for lang in (ENGLISH, TWI)}
@@ -149,6 +151,28 @@ DEFAULT = ENGLISH
 def get(code: str) -> Language:
     """Return the registered language for ``code``; raises KeyError if unknown."""
     return LANGUAGES[code.strip().lower()]
+
+
+def normalise_code(raw: str | None) -> str:
+    """Map a detector's language label to a registry code where possible
+    ("ak", "Twi" -> "tw", "en-US" -> "en"). Unregistered codes are returned
+    lowercased, and an empty label becomes ""."""
+    code = (raw or "").strip().lower().replace("_", "-").split("-")[0]
+    if code in LANGUAGES:
+        return code
+    for lang in LANGUAGES.values():
+        if code in lang.aliases or code == lang.name.lower():
+            return lang.code
+    return code
+
+
+def bm25_fold_table() -> dict[int, str]:
+    """str.translate table folding every language's special letters, so
+    "Onyankopon" and "Onyankopɔn" tokenise the same for BM25."""
+    folds: dict[str, str] = {}
+    for lang in LANGUAGES.values():
+        folds.update(lang.bm25_fold)
+    return str.maketrans(folds)
 
 
 def enabled() -> list[Language]:

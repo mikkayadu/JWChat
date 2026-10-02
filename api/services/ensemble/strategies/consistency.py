@@ -24,10 +24,15 @@ _SIMILARITY_THRESHOLD = 0.8
 class ConsistencyAgent(ReasoningStrategy):
     name = "consistency"
 
-    async def arun(self, question: str, context: str) -> str:
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
         samples = await asyncio.gather(
             *(
-                self._finalize(question, context, temperature=_SAMPLE_TEMPERATURE)
+                self._finalize(
+                    question,
+                    context,
+                    answer_language=answer_language,
+                    temperature=_SAMPLE_TEMPERATURE,
+                )
                 for _ in range(_SAMPLES)
             )
         )

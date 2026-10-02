@@ -10,7 +10,7 @@ them meaningful rather than redundant.
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from .base import CITATION_RULES, ReasoningStrategy
+from .base import CITATION_RULES, ReasoningStrategy, language_rules
 
 _TEMPERATURE = 0.4
 
@@ -24,7 +24,8 @@ _COT_PROMPT = ChatPromptTemplate.from_messages(
             "step by step in your head: identify which passages are relevant, "
             "what each one contributes, and how they fit together. "
             "Do NOT show this reasoning in your reply — output only the "
-            "final answer in the response format described above.",
+            "final answer in the response format described above."
+            "{language_rules}",
         ),
         (
             "human",
@@ -38,9 +39,13 @@ _COT_PROMPT = ChatPromptTemplate.from_messages(
 class CoTAgent(ReasoningStrategy):
     name = "cot"
 
-    async def arun(self, question: str, context: str) -> str:
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
         return await self._ainvoke(
             _COT_PROMPT,
-            {"question": question, "context": context},
+            {
+                "question": question,
+                "context": context,
+                "language_rules": language_rules(answer_language),
+            },
             temperature=_TEMPERATURE,
         )

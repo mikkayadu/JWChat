@@ -40,7 +40,7 @@ _PASSAGE_HEADER_RE = re.compile(r"^\[(\d+)\]\s*Source:")
 class ReActAgent(ReasoningStrategy):
     name = "react"
 
-    async def arun(self, question: str, context: str) -> str:
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
         passages = self._index_passages(context)
         transcript_lines: list[str] = []
 
@@ -67,7 +67,7 @@ class ReActAgent(ReasoningStrategy):
             transcript_lines.append(observation)
 
         notes = "\n".join(transcript_lines)
-        return await self._finalize(question, context, notes=notes)
+        return await self._finalize(question, context, notes=notes, answer_language=answer_language)
 
     @staticmethod
     def _index_passages(context: str) -> dict[int, str]:

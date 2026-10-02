@@ -15,6 +15,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 
+import languages
+
 # Mirrors the citation/context-only rules baked into ChatService._answer_prompt
 # (api/services/chat_service.py:162-187) so every strategy's final answer is
 # bound by the same constraints as the baseline.
@@ -36,9 +38,38 @@ CITATION_RULES = (
     "- End with a 'Sources:' section listing each cited reference by number."
 )
 
+
+def language_rules(answer_language: str) -> str:
+    """Prompt rules that make the answer come out in ``answer_language``.
+
+    Shared by ChatService._answer_prompt and every strategy's final step.
+    Empty for English, so English prompts are exactly what they were before
+    languages existed. Appended after the other rules so its wording rules
+    (not-found sentence, book names) take precedence.
+    """
+    lang = languages.get(answer_language)
+    if lang.code == languages.DEFAULT.code:
+        return ""
+    example = f"{lang.book_names[42]} 3:16"  # John 3:16
+    return (
+        "\n\nLANGUAGE RULES (these override any wording instruction above):\n"
+        f"- Write the whole answer in {lang.name}.\n"
+        "- Each context passage is labelled with its language. Translate what you use "
+        f"from passages in other languages faithfully into {lang.name}: do not add, "
+        "drop or soften anything in translation.\n"
+        f"- If any passage you cite is not in {lang.name}, begin the answer with this "
+        f'sentence, exactly: "{lang.messages.english_sources_note}"\n'
+        "- If the context does not contain the answer, respond exactly: "
+        f'"{lang.messages.not_found}"\n'
+        f"- Write scripture references with these {lang.name} Bible book names, in "
+        f"Bible order: {', '.join(lang.book_names)}. Keep chapter and verse numbers as "
+        f'digits, e.g. "{example}".'
+    )
+
+
 FINAL_ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     [
-        ("system", CITATION_RULES),
+        ("system", CITATION_RULES + "{language_rules}"),
         (
             "human",
             "Question:\n{question}\n\nContext:\n{context}\n\n"
@@ -70,8 +101,12 @@ class ReasoningStrategy(ABC):
         self._call_count = 0
 
     @abstractmethod
-    async def arun(self, question: str, context: str) -> str:
-        """Produce the final cited answer for this strategy."""
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
+        """Produce the final cited answer for this strategy, in ``answer_language``.
+
+        The language is a parameter rather than instance state because one
+        strategy instance is shared by concurrent requests.
+        """
 
     async def _ainvoke(
         self,
@@ -101,6 +136,7 @@ class ReasoningStrategy(ABC):
         context: str,
         notes: str = "",
         *,
+        answer_language: str = "en",
         temperature: float = 0.0,
     ) -> str:
         """Funnel intermediate reasoning into the converged, citation-compliant
@@ -119,19 +155,24 @@ class ReasoningStrategy(ABC):
         )
         text = await self._ainvoke(
             FINAL_ANSWER_PROMPT,
-            {"question": question, "context": context, "notes_block": notes_block},
+            {
+                "question": question,
+                "context": context,
+                "notes_block": notes_block,
+                "language_rules": language_rules(answer_language),
+            },
             temperature=temperature,
         )
         return text or "I could not generate a response."
 
-    async def run_logged(self, question: str, context: str) -> str:
+    async def run_logged(self, question: str, context: str, answer_language: str = "en") -> str:
         """Entry point the orchestrator calls — wraps :meth:`arun` with
         ``[ENSEMBLE:{name}]`` timing, call-count, and error logging."""
         self._call_count = 0
         start = time.time()
         logger.info(f"[ENSEMBLE:{self.name}] starting")
         try:
-            answer = await self.arun(question, context)
+            answer = await self.arun(question, context, answer_language)
         except Exception as e:
             duration_ms = (time.time() - start) * 1000
             logger.warning(

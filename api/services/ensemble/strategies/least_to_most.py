@@ -55,7 +55,7 @@ _SUBQ_RE = re.compile(r"^\s*\d+[.)]\s*(.+)$", re.MULTILINE)
 class LeastToMostAgent(ReasoningStrategy):
     name = "least_to_most"
 
-    async def arun(self, question: str, context: str) -> str:
+    async def arun(self, question: str, context: str, answer_language: str = "en") -> str:
         subquestions = await self._order(question)
 
         chain: list[tuple[str, str]] = []
@@ -73,7 +73,7 @@ class LeastToMostAgent(ReasoningStrategy):
             chain.append((sq, answer))
 
         notes = "\n\n".join(f"Sub-question: {q}\nSub-answer: {a}" for q, a in chain)
-        return await self._finalize(question, context, notes=notes)
+        return await self._finalize(question, context, notes=notes, answer_language=answer_language)
 
     async def _order(self, question: str) -> list[str]:
         raw = await self._ainvoke(_ORDER_PROMPT, {"question": question}, temperature=_TEMPERATURE)
