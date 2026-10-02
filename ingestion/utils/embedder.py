@@ -38,6 +38,13 @@ def _is_low_quality_error_chunk(text: str) -> bool:
 
 
 def _normalize_metadata_text(text: str) -> str:
+    """Tidy chunk text for storage in Pinecone metadata.
+
+    Folds curly quotes and dashes and strips zero-width characters, but keeps
+    every other Unicode character: Twi's ɛ/ɔ (and Greek/Hebrew terms in study
+    notes) must survive into the LLM context and UI snippets. NFC rather than
+    NFKC so compatibility characters are left as the source wrote them.
+    """
     if not text:
         return ""
 
@@ -52,8 +59,7 @@ def _normalize_metadata_text(text: str) -> str:
         .replace("\ufeff", "")
     )
 
-    normalized = unicodedata.normalize("NFKC", normalized)
-    return normalized.encode("latin-1", "ignore").decode("latin-1")
+    return unicodedata.normalize("NFC", normalized)
 
 
 def normalize_vector_dimensions(vector: list[float], target_dim: int) -> list[float]:
