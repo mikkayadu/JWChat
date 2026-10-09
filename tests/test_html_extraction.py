@@ -86,3 +86,12 @@ def test_browser_is_the_fallback(monkeypatch):
     monkeypatch.setattr(html_scraper, "_fetch_with_playwright", lambda url: (_page(f"<p>{_FILLER}</p>"), 200))
     assert scrape_url(_URL) is not None
     assert scrape_url(_URL, use_playwright=False) is None
+
+
+def test_article_box_in_aside_is_kept():
+    text = _text(
+        f"<p>{_FILLER}</p><div class='boxSupplement'><aside><div class='boxContent'>"
+        "<p>What history reveals: Nebuchadnezzar carried out massive building projects.</p>"
+        "</div></aside></div>"
+    )
+    assert "Nebuchadnezzar carried out massive building projects" in text

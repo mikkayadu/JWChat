@@ -205,8 +205,11 @@ def _parse_html(
 
     soup = BeautifulSoup(html, "lxml")
 
-    # Remove noise tags entirely
+    # Remove noise tags entirely, except <aside> inside the article: jw.org
+    # puts article boxes ("What does history reveal ...?") there.
     for tag in soup.find_all(_NOISE_TAGS):
+        if tag.name == "aside" and tag.find_parent("article"):
+            continue
         tag.decompose()
 
     # Remove elements whose class/id suggests boilerplate
