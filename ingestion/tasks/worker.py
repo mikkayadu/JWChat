@@ -255,7 +255,7 @@ def crawl_and_enqueue(
     url: str,
     job_id: str,
     allowed_domain: str,
-    max_pages: int = 1000,
+    max_pages: int | None = None,
     delay: float = 0.0,
     include_subdomains: bool = False,
     respect_robots: bool = True,
@@ -325,7 +325,7 @@ def crawl_and_enqueue(
             return {"url": canonical_url, "status": "skipped_extension"}
 
         current_count = int(redis_client.get(pages_key) or 0)
-        if current_count >= max_pages:
+        if max_pages is not None and current_count >= max_pages:
             return {"url": canonical_url, "status": "max_pages_reached", "pages": current_count}
 
         if respect_robots:
@@ -344,7 +344,7 @@ def crawl_and_enqueue(
             return {"url": canonical_url, "status": "fetch_failed"}
 
         pages = redis_client.incr(pages_key)
-        if pages > max_pages:
+        if max_pages is not None and pages > max_pages:
             return {"url": canonical_url, "status": "max_pages_reached", "pages": pages}
 
         ingest_url.delay(canonical_url, use_playwright=use_playwright, language=language)
@@ -382,7 +382,7 @@ def crawl_and_enqueue(
         redis_client.expire(queued_key, ttl_seconds)
 
         logger.info(
-            f"[CRAWL] {canonical_url} | pages={pages}/{max_pages} | children_queued={queued_children}"
+            f"[CRAWL] {canonical_url} | pages={pages}/{max_pages or '∞'} | children_queued={queued_children}"
         )
         return {
             "url": canonical_url,

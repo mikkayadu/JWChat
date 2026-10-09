@@ -57,7 +57,7 @@ def parse_args():
     # Auto-crawl (no URL lists needed)
     parser.add_argument("--crawl",   help="Auto-crawl entire site from this URL (e.g. https://yoursite.com)")
     parser.add_argument("--sitemap", help="Use sitemap.xml to discover all URLs (faster than --crawl)")
-    parser.add_argument("--max-pages", type=int, default=1000, help="Max pages to crawl (default: 1000)")
+    parser.add_argument("--max-pages", type=int, default=None, help="Max pages to crawl (default: no limit)")
     parser.add_argument("--crawl-delay", type=float, default=0.5, help="Seconds between requests (default: 0.5)")
 
     # URL-based inputs (no downloading needed)
@@ -121,7 +121,7 @@ def run_pipeline(args):
 
 def ingest_by_crawl(
     start_url: str,
-    max_pages: int = 1000,
+    max_pages: int | None = None,
     delay: float = 0.5,
     sync: bool = False,
     whisper_model: str = "base",

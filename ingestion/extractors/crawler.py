@@ -81,7 +81,7 @@ def _is_jworg_video_page(url: str) -> bool:
 
 def crawl_site(
     start_url: str,
-    max_pages: int = 1000,
+    max_pages: int | None = 1000,
     delay: float = 0.5,
     respect_robots: bool = True,
     include_subdomains: bool = False,
@@ -94,7 +94,7 @@ def crawl_site(
 
     Args:
         start_url:          The homepage or starting page to crawl from
-        max_pages:          Safety cap — stop after this many pages
+        max_pages:          Safety cap — stop after this many pages (None: no limit)
         delay:              Seconds to wait between requests (be polite)
         respect_robots:     Whether to honour robots.txt disallow rules
         include_subdomains: Whether to follow links to subdomains
@@ -114,7 +114,7 @@ def crawl_site(
     logger.info(f"Starting crawl from: {start_url}")
     logger.info(f"Domain: {base_domain} | Max pages: {max_pages} | Delay: {delay}s")
 
-    while queue and len(found) < max_pages:
+    while queue and (max_pages is None or len(found) < max_pages):
         url = queue.popleft()
 
         if url in visited:
@@ -146,7 +146,7 @@ def crawl_site(
             continue
 
         found.append(url)
-        logger.info(f"  [{len(found)}/{max_pages}] {url}")
+        logger.info(f"  [{len(found)}/{max_pages or '∞'}] {url}")
 
         # Extract and queue all internal links
         links = _extract_links(html, url, base_domain, include_subdomains, path_prefix)
