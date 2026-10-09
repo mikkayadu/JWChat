@@ -123,6 +123,12 @@ def _embed_and_store(chunks, language: str = "en"):
     return len(embedded)
 
 
+def _already_ingested(source: str, language: str) -> bool:
+    from ingestion.utils.embedder import source_exists
+
+    return source_exists(_get_vector_client(), source, language)
+
+
 def _resolve_language(source: str, language: str | None) -> str:
     """Language code for a document: the explicit override wins, then the
     jw.org URL locale, then English."""
@@ -155,6 +161,11 @@ def ingest_pdf(self, file_path: str, language: str | None = None):
         from ingestion.extractors.pdf_extractor import extract_pdf
         from ingestion.utils.chunker import chunk_pages
 
+        lang = _resolve_language(file_path, language)
+        if _already_ingested(file_path, lang):
+            logger.info(f"[PDF] Skipped (already in Pinecone): {file_path}")
+            return {"file": file_path, "vectors": 0, "status": "already_ingested"}
+
         logger.info(f"[PDF] Starting: {file_path}")
         pages = extract_pdf(file_path)
         chunks = chunk_pages(
@@ -162,7 +173,7 @@ def ingest_pdf(self, file_path: str, language: str | None = None):
             chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
         )
-        count = _embed_and_store(chunks, _resolve_language(file_path, language))
+        count = _embed_and_store(chunks, lang)
         logger.success(f"[PDF] Done: {file_path} → {count} vectors")
         return {"file": file_path, "vectors": count}
 
@@ -185,6 +196,10 @@ def ingest_url(self, url: str, use_playwright: bool = True, language: str | None
             return {"url": url, "vectors": 0, "error": "excluded_path"}
 
         lang = _resolve_language(url, language)
+        if _already_ingested(url, lang):
+            logger.info(f"[HTML] Skipped (already in Pinecone): {url}")
+            return {"url": url, "vectors": 0, "status": "already_ingested"}
+
         logger.info(f"[HTML] Starting: {url} (language={lang})")
         page = scrape_url(url, use_playwright=use_playwright, language=lang)
         if not page:
@@ -221,6 +236,11 @@ def ingest_video(
     try:
         from ingestion.utils.chunker import chunk_text
 
+        lang = _resolve_language(source, language)
+        if _already_ingested(source, lang):
+            logger.info(f"[VIDEO] Skipped (already in Pinecone): {source}")
+            return {"source": source, "vectors": 0, "status": "already_ingested"}
+
         logger.info(f"[VIDEO] Starting: {source}")
 
         if is_url:
@@ -240,7 +260,7 @@ def ingest_video(
             chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
         )
-        count = _embed_and_store(chunks, _resolve_language(source, language))
+        count = _embed_and_store(chunks, lang)
         logger.success(f"[VIDEO] Done: {source} → {count} vectors")
         return {"source": source, "vectors": count}
 

@@ -258,3 +258,33 @@ def upsert_embeddings(
         logger.debug(f"Upserted batch {i // batch_size + 1} ({len(batch)} points)")
 
     logger.success(f"Done: {len(filtered_embedded)} vectors in '{collection_name}'")
+
+
+def source_exists(client, source: str, language: str = "en") -> bool:
+    """
+    True if any vector from ``source`` is already in ``language``'s namespace,
+    so callers can skip scraping and embedding it again. A failed lookup
+    returns False: ingesting twice is safe (IDs are deterministic).
+    """
+    import languages
+
+    lang = languages.get(language)
+    namespace_kwargs = {"namespace": lang.namespace} if lang.namespace else {}
+    dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", 768))
+    # Only the metadata filter matters; any non-zero vector of the index size works.
+    probe = [1.0] + [0.0] * (dimensions - 1)
+
+    try:
+        result = client.query(
+            vector=probe,
+            top_k=1,
+            filter={"source": {"$eq": source}},
+            include_values=False,
+            include_metadata=False,
+            **namespace_kwargs,
+        )
+    except Exception as e:
+        logger.warning(f"Pinecone lookup failed for {source}: {e} — ingesting anyway")
+        return False
+
+    return bool(result.matches)

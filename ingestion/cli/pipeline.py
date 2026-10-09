@@ -329,10 +329,17 @@ def _ingest_discovered_urls(
 def _sync_pdf(source: str, language: str | None = None):
     from ingestion.extractors.pdf_extractor import extract_pdf
     from ingestion.utils.chunker import chunk_pages
-    from ingestion.utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    from ingestion.utils.embedder import (
+        embed_chunks, upsert_embeddings, init_collection, source_exists,
+    )
     import os
 
     lang = languages.resolve_ingest_language(source, language).code
+    client = init_collection()
+    if source_exists(client, source, lang):
+        logger.info(f"[PDF][sync] Skipped (already in Pinecone): {source}")
+        return
+
     pages = extract_pdf(source)  # handles URLs automatically
     chunks = chunk_pages(pages)
     embedded = embed_chunks(
@@ -340,18 +347,24 @@ def _sync_pdf(source: str, language: str | None = None):
         api_key=os.getenv("GEMINI_API_KEY"),
         model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
     )
-    client = init_collection()
     upsert_embeddings(embedded, client, language=lang)
 
 
 def _sync_html(url: str, language: str | None = None):
     from ingestion.extractors.html_scraper import scrape_url
     from ingestion.utils.chunker import chunk_text
-    from ingestion.utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    from ingestion.utils.embedder import (
+        embed_chunks, upsert_embeddings, init_collection, source_exists,
+    )
     from ingestion.utils.preprocessor import preprocess, enrich_chunks_with_context
     import os
 
     lang = languages.resolve_ingest_language(url, language).code
+    client = init_collection()
+    if source_exists(client, url, lang):
+        logger.info(f"[HTML][sync] Skipped (already in Pinecone): {url}")
+        return
+
     page = scrape_url(url, language=lang)
     if not page:
         logger.warning(f"[HTML][sync] Skipped: {url} (scrape failed or page deemed non-content/error)")
@@ -365,17 +378,23 @@ def _sync_html(url: str, language: str | None = None):
         api_key=os.getenv("GEMINI_API_KEY"),
         model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
     )
-    client = init_collection()
     upsert_embeddings(embedded, client, language=lang)
 
 
 def _sync_video(source: str, model_size: str = "base", language: str | None = None):
     from ingestion.extractors.video_transcriber import transcribe_file, transcribe_url
     from ingestion.utils.chunker import chunk_text
-    from ingestion.utils.embedder import embed_chunks, upsert_embeddings, init_collection
+    from ingestion.utils.embedder import (
+        embed_chunks, upsert_embeddings, init_collection, source_exists,
+    )
     import os
 
     lang = languages.resolve_ingest_language(source, language).code
+    client = init_collection()
+    if source_exists(client, source, lang):
+        logger.info(f"[VIDEO][sync] Skipped (already in Pinecone): {source}")
+        return
+
     if source.startswith("http://") or source.startswith("https://"):
         result = transcribe_url(source, model_size)
     else:
@@ -389,7 +408,6 @@ def _sync_video(source: str, model_size: str = "base", language: str | None = No
         api_key=os.getenv("GEMINI_API_KEY"),
         model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
     )
-    client = init_collection()
     upsert_embeddings(embedded, client, language=lang)
 
 
