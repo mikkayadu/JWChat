@@ -29,6 +29,14 @@ _NOISE_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
+# Elements that start a new paragraph. Everything else (links, emphasis,
+# spans) is inline and joins the surrounding sentence, so a scripture link
+# stays inside "(James 1:13)" instead of becoming a line of its own.
+_BLOCK_TAGS = [
+    "p", "div", "section", "article", "main", "blockquote", "pre",
+    "ul", "ol", "li", "dl", "dt", "dd", "table", "tr",
+]
+
 _ERROR_TITLE_PATTERNS = re.compile(
     r"(request could not be satisfied|access denied|forbidden|not found|captcha|blocked)",
     re.IGNORECASE,
@@ -203,6 +211,11 @@ def _parse_html(
         class_id = " ".join(classes) + " " + (tag.get("id") or "")
         if _NOISE_PATTERNS.search(class_id):
             tag.decompose()
+
+    # jw.org footnote letters (the "a" after "...original sin." and before the
+    # footnote itself) would read as stray words once inline text is joined.
+    for marker in soup.select("a.footnoteLink, a.fn-symbol"):
+        marker.decompose()
 
     title = soup.title.get_text(strip=True) if soup.title else url
 
@@ -379,26 +392,40 @@ def _maybe_dump_html(url: str, html: str, stage: str) -> None:
 
 def _extract_structured_text(tag) -> str:
     """
-    Extract text from a BeautifulSoup tag while converting HTML heading tags
-    (h1-h4) into Markdown markers (#, ##, ###, ####).
+    Extract text from a BeautifulSoup tag as one paragraph per block element,
+    separated by blank lines, converting HTML heading tags (h1-h4) into
+    Markdown markers (#, ##, ###, ####).
 
-    This preserves the document's section hierarchy so the chunker can use
-    headings as natural split boundaries, and the context enricher can label
-    each chunk with its nearest section heading.
+    Inline elements are joined the way a browser renders them, so a link in a
+    sentence stays in the sentence. The blank lines give the chunker and the
+    paragraph dedup real paragraph boundaries, and the headings let the
+    context enricher label each chunk with its nearest section heading.
 
-    Replaces headings directly on the tag (safe — the tag is discarded after
-    this call; it's never reused elsewhere in the scraper).
+    Modifies the tag in place (safe — the tag is discarded after this call;
+    it's never reused elsewhere in the scraper).
     """
     _HEADING_MAP = {"h1": "#", "h2": "##", "h3": "###", "h4": "####"}
 
     for level, marker in _HEADING_MAP.items():
         for heading in tag.find_all(level):
-            heading_text = heading.get_text(strip=True)
+            heading_text = re.sub(r"\s+", " ", heading.get_text()).strip()
             if heading_text:
                 heading.replace_with(f"\n\n{marker} {heading_text}\n\n")
 
-    lines = [ln.strip() for ln in tag.get_text(separator="\n").splitlines()]
-    return "\n".join(ln for ln in lines if ln)
+    for block in tag.find_all(_BLOCK_TAGS):
+        block.insert_before("\n\n")
+        block.insert_after("\n\n")
+    # Keep table cells and line breaks from gluing words together.
+    for cell in tag.find_all(["td", "th"]):
+        cell.insert_after(" ")
+    for br in tag.find_all("br"):
+        br.replace_with(" ")
+
+    paragraphs = (
+        re.sub(r"\s+", " ", para).strip()
+        for para in re.split(r"\n\s*\n", tag.get_text())
+    )
+    return "\n\n".join(para for para in paragraphs if para)
 
 
 def _apply_site_cookies(context, url: str) -> None:

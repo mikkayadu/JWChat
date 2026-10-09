@@ -1,0 +1,46 @@
+from ingestion.extractors.html_scraper import _parse_html
+from ingestion.utils.preprocessor import preprocess, remove_boilerplate_lines
+
+_URL = "https://www.jw.org/en/bible-teachings/questions/x/"
+_FILLER = " ".join(["Suffering was not part of Jehovah God's purpose for mankind."] * 30)
+
+
+def _page(body):
+    return (
+        "<html><head><title>Why Do We Suffer?</title></head>"
+        f"<body><article id='article'>{body}</article></body></html>"
+    )
+
+
+def _text(body):
+    return preprocess(_parse_html(_page(body), _URL, status_code=200)).text
+
+
+def test_scripture_link_stays_in_its_sentence():
+    text = _text(
+        f"<p>{_FILLER}</p>"
+        '<p>God cannot be tried nor does he himself try anyone." '
+        "(<a class='jsBibleLink' href='/en/library/bible/study-bible/books/james/1/'>James 1:13</a>) "
+        "Suffering can afflict anyone.</p>"
+    )
+    assert 'try anyone." (James 1:13) Suffering can afflict anyone.' in text
+
+
+def test_paragraphs_are_separated_by_blank_lines():
+    text = _text(f"<h2>The Bible's answer</h2><p>{_FILLER}</p><p>A second paragraph with several words.</p>")
+    assert "## The Bible's answer\n\n" in text
+    assert "\n\nA second paragraph with several words." in text
+
+
+def test_short_scripture_line_survives_boilerplate_filter():
+    assert remove_boilerplate_lines("Exodus 20:3\nShare\nPrint") == "Exodus 20:3"
+
+
+def test_footnote_letters_are_removed():
+    text = _text(
+        f"<p>{_FILLER}</p>"
+        "<p>They committed the original sin.<a class='footnoteLink' href='#footnote1'>a</a> (Genesis 3:6)</p>"
+        "<p><a class='fn-symbol' href='#footnotesource1'>a</a> The expression is not in the Bible.</p>"
+    )
+    assert "original sin. (Genesis 3:6)" in text
+    assert "\n\nThe expression is not in the Bible." in text

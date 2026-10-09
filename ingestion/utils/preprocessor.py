@@ -48,6 +48,10 @@ _BOILERPLATE_RE = re.compile(
 
 _MIN_WORDS_PER_LINE = 4
 
+# A chapter:verse pair ("Exodus 20:3", "Yohane 3:16"). A short line holding
+# one is a scripture reference, not boilerplate.
+_SCRIPTURE_REF_RE = re.compile(r"\d+:\d+")
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -130,7 +134,8 @@ def remove_boilerplate_lines(text: str) -> str:
       - Blank lines are always kept (they mark paragraph boundaries)
       - Markdown headings (# ...) are always kept
       - Lines matching known boilerplate phrases are dropped
-      - Lines with fewer than _MIN_WORDS_PER_LINE words are dropped
+      - Lines with fewer than _MIN_WORDS_PER_LINE words are dropped, unless
+        they hold a scripture reference
     """
     filtered = []
     for line in text.splitlines():
@@ -147,7 +152,10 @@ def remove_boilerplate_lines(text: str) -> str:
         if _BOILERPLATE_RE.match(stripped):
             continue
 
-        if len(re.findall(r"\b\w+\b", stripped)) < _MIN_WORDS_PER_LINE:
+        if (
+            len(re.findall(r"\b\w+\b", stripped)) < _MIN_WORDS_PER_LINE
+            and not _SCRIPTURE_REF_RE.search(stripped)
+        ):
             continue
 
         filtered.append(line)
