@@ -1,8 +1,9 @@
 """
 HTML Ingestion
 ─────────────
-Scrapes public web pages using Playwright (handles JS-rendered pages)
-with a BeautifulSoup fallback for simple static pages.
+Scrapes public web pages over plain HTTP, with Playwright as a fallback for
+pages that need a browser (JS-rendered or blocked), and parses them with
+BeautifulSoup.
 
 Strips navigation, footers, ads and other boilerplate automatically.
 """
@@ -23,9 +24,11 @@ _NOISE_TAGS = [
     "svg", "img", "figure", "figcaption", "advertisement",
 ]
 
-# CSS classes/IDs that usually signal boilerplate
+# CSS classes/IDs that usually signal boilerplate. "vjs-" is the video.js
+# player, whose controls and dialogs ("This is a modal window.") appear in
+# browser-rendered pages.
 _NOISE_PATTERNS = re.compile(
-    r"(nav|menu|sidebar|footer|header|cookie|banner|ad-|advertisement|social|share)",
+    r"(nav|menu|sidebar|footer|header|cookie|banner|ad-|advertisement|social|share|vjs-)",
     re.IGNORECASE
 )
 
@@ -89,14 +92,17 @@ def scrape_url(
 ) -> ExtractedPage | None:
     """
     Scrape a single URL and return its cleaned text content.
-    Set use_playwright=False for simple static pages (faster).
+
+    Fetches over plain HTTP first: jw.org renders its articles on the server,
+    and a browser only adds the video player's text and ~4s per page. The
+    browser is the fallback when that fetch fails or yields no usable content;
+    set use_playwright=False to skip it.
     ``language`` overrides the language inferred from the URL.
     """
-    fetched = _fetch_html(url, use_playwright)
-    if not fetched:
-        return None
-    raw_html, status_code = fetched
-    return _parse_html(raw_html, url, status_code=status_code, language=language)
+    page = _scrape_with(_fetch_with_httpx, url, language)
+    if page is None and use_playwright:
+        page = _scrape_with(_fetch_with_playwright, url, language)
+    return page
 
 
 def scrape_urls(urls: list[str], use_playwright: bool = True) -> list[ExtractedPage]:
@@ -109,10 +115,12 @@ def scrape_urls(urls: list[str], use_playwright: bool = True) -> list[ExtractedP
     return results
 
 
-def _fetch_html(url: str, use_playwright: bool) -> tuple[str, int | None] | None:
-    if use_playwright:
-        return _fetch_with_playwright(url)
-    return _fetch_with_httpx(url)
+def _scrape_with(fetch, url: str, language: str | None) -> ExtractedPage | None:
+    fetched = fetch(url)
+    if not fetched:
+        return None
+    raw_html, status_code = fetched
+    return _parse_html(raw_html, url, status_code=status_code, language=language)
 
 
 def _fetch_with_playwright(url: str) -> tuple[str, int | None] | None:
