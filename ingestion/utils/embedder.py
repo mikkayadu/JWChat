@@ -52,7 +52,7 @@ def _retry_delay_seconds(e: Exception) -> float:
     return float(match.group(1)) + 1 if match else 60.0
 
 
-def _embed_content(genai, model: str, text: str):
+def _embed_content(genai, model: str, content: str | list[str]):
     """genai.embed_content, waiting out per-minute rate limits. Raises
     EmbeddingQuotaExhausted when a daily quota is spent, or when the limit
     doesn't clear after several waits."""
@@ -60,7 +60,7 @@ def _embed_content(genai, model: str, text: str):
         try:
             return genai.embed_content(
                 model=model,
-                content=text,
+                content=content,
                 task_type="retrieval_document",
                 output_dimensionality=768,
             )
@@ -128,11 +128,17 @@ def embed_chunks(
     chunks: list[TextChunk],
     api_key: str | None = None,
     model: str = "models/gemini-embedding-001",
-    batch_size: int = 100,
+    batch_size: int = 20,
 ) -> list[dict]:
     """
-    Embed a list of TextChunks using Gemini.
-    Returns list of dicts: {chunk, vector}
+    Embed a list of TextChunks using Gemini, ``batch_size`` chunks per request.
+    Returns list of dicts: {chunk, vector}, or nothing when a batch keeps
+    failing: a page is stored whole or not at all, since the skip-if-ingested
+    check would never fill in a missing chunk.
+
+    One request per batch rather than per chunk: same vectors, and ~1s less
+    per page. The batch stays small because its tokens still count toward
+    Gemini's per-minute token limit; 20 chunks cover all but a handful of pages.
     """
     import google.generativeai as genai
 
@@ -167,35 +173,43 @@ def embed_chunks(
 
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i : i + batch_size]
-        for chunk in batch:
-            success = False
-            for attempt in range(3):
-                try:
-                    response = _embed_content(genai, model, chunk.text)
-                    vector = response["embedding"]
-                    if target_dim > 0 and len(vector) != target_dim:
-                        if not resize_logged:
-                            logger.warning(
-                                f"Resizing embedding vectors from {len(vector)} to {target_dim} to match configured index dimension"
-                            )
-                            resize_logged = True
-                        vector = normalize_vector_dimensions(vector, target_dim)
-                    results.append({"chunk": chunk, "vector": vector})
-                    success = True
-                    break
-                except EmbeddingQuotaExhausted:
-                    # Drop the whole page rather than store part of it: the
-                    # skip-if-ingested check would never fill in the rest.
-                    raise
-                except Exception as e:
-                    wait = 2 ** attempt
-                    logger.warning(
-                        f"Embedding failed for chunk {chunk.chunk_index} (attempt {attempt + 1}): {e}. Retrying in {wait}s..."
-                    )
-                    time.sleep(wait)
+        vectors = None
+        for attempt in range(3):
+            try:
+                response = _embed_content(genai, model, [chunk.text for chunk in batch])
+                vectors = response["embedding"]
+                if len(vectors) != len(batch):
+                    raise ValueError(f"got {len(vectors)} vectors for {len(batch)} chunks")
+                break
+            except EmbeddingQuotaExhausted:
+                # Drop the whole page rather than store part of it: the
+                # skip-if-ingested check would never fill in the rest.
+                raise
+            except Exception as e:
+                vectors = None
+                wait = 2 ** attempt
+                logger.warning(
+                    f"Embedding failed for chunks {batch[0].chunk_index}-{batch[-1].chunk_index} "
+                    f"(attempt {attempt + 1}): {e}. Retrying in {wait}s..."
+                )
+                time.sleep(wait)
 
-            if not success:
-                logger.error(f"Skipping chunk {chunk.chunk_index} after 3 failed attempts")
+        if vectors is None:
+            logger.error(
+                f"Dropping {batch[0].source}: embedding failed after 3 attempts. "
+                "Nothing is stored, so a later run ingests it again."
+            )
+            return []
+
+        for chunk, vector in zip(batch, vectors):
+            if target_dim > 0 and len(vector) != target_dim:
+                if not resize_logged:
+                    logger.warning(
+                        f"Resizing embedding vectors from {len(vector)} to {target_dim} to match configured index dimension"
+                    )
+                    resize_logged = True
+                vector = normalize_vector_dimensions(vector, target_dim)
+            results.append({"chunk": chunk, "vector": vector})
 
         time.sleep(0.05)
 

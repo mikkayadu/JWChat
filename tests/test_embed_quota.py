@@ -52,7 +52,7 @@ def test_daily_quota_stops_immediately(monkeypatch, sleeps):
 
 
 def test_per_minute_limit_waits_and_retries(monkeypatch, sleeps):
-    _embed_responses(monkeypatch, _PER_MINUTE, {"embedding": [0.1] * 768})
+    _embed_responses(monkeypatch, _PER_MINUTE, {"embedding": [[0.1] * 768]})
     results = embed_chunks(_chunks(), api_key="k")
     assert len(results) == 1
     assert sleeps[0] == 8.0
