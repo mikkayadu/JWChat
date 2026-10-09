@@ -58,10 +58,19 @@ SKIP_EXTENSIONS = {
 # tw "/nhomakorabea/bible/"), so the list is the registry's union.
 EXCLUDED_PATH_PATTERNS = list(languages.excluded_paths())
 
+# jw.org pages with no content of their own: the language picker
+# ("/en/choose-language?docid=...") and "/open?lank=...", which redirects to a
+# page that has its own URL. Matched on the whole path so slugs like
+# "open-minded" still get through.
+_UTILITY_PATH_RE = re.compile(r"^(?:/[^/]+)?/(?:choose-language|open)/?$")
+
 
 def _is_excluded_url(url: str) -> bool:
     path = urlparse(url).path.lower()
-    return any(pattern in path for pattern in EXCLUDED_PATH_PATTERNS)
+    return (
+        any(pattern in path for pattern in EXCLUDED_PATH_PATTERNS)
+        or bool(_UTILITY_PATH_RE.match(path))
+    )
 
 
 def _in_path_scope(path: str, path_prefix: str | None) -> bool:

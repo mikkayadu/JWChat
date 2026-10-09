@@ -41,3 +41,10 @@ def test_bible_pages_excluded_in_both_languages():
     assert _is_excluded_url("https://www.jw.org/en/library/bible/study-bible/books/john/3/")
     assert _is_excluded_url("https://www.jw.org/tw/nhomakorabea/bible/nwt/nhoma/yohane/3/")
     assert not _is_excluded_url("https://www.jw.org/tw/nhomakorabea/nhoma/")
+
+
+def test_language_picker_and_redirect_pages_excluded():
+    assert _is_excluded_url("https://www.jw.org/en/choose-language?docid=1011756&locale=en&prefer=lang")
+    assert _is_excluded_url("https://www.jw.org/tw/choose-language?docid=1011756")
+    assert _is_excluded_url("https://www.jw.org/open?lank=pub-cpw_x_VIDEO&wtlocale=E")
+    assert not _is_excluded_url("https://www.jw.org/en/bible-teachings/questions/open-minded/")

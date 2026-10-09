@@ -327,6 +327,7 @@ def crawl_and_enqueue(
             _fetch,
             _get_extension,
             _is_disallowed,
+            _is_excluded_url,
             _is_video_page_url,
             _load_robots,
             _normalise,
@@ -363,6 +364,13 @@ def crawl_and_enqueue(
         redis_client.expire(seen_key, ttl_seconds)
         redis_client.expire(pages_key, ttl_seconds)
         redis_client.expire(failed_key, ttl_seconds)
+
+        # Check before fetching, as crawl_site does: ingest_url would skip the
+        # page anyway, and fetching it would spend a --max-pages slot and
+        # follow its links (the Bible link on every page leads into the
+        # whole online Bible).
+        if _is_excluded_url(canonical_url):
+            return {"url": canonical_url, "status": "excluded_path"}
 
         ext = _get_extension(canonical_url)
         if ext in MEDIA_EXTENSIONS:

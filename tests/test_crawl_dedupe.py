@@ -40,3 +40,17 @@ def test_links_shared_between_pages_are_queued_once(monkeypatch):
     worker.crawl_and_enqueue("https://www.jw.org/en/b", "job", "www.jw.org", respect_robots=False)
 
     assert queued == [_NAV, _ARTICLE]
+
+
+def test_excluded_page_is_not_fetched(monkeypatch):
+    def fail(url):
+        raise AssertionError("an excluded page must not be fetched")
+
+    monkeypatch.setattr(worker, "_get_redis_client", lambda: _FakeRedis())
+    monkeypatch.setattr("ingestion.extractors.crawler._fetch", fail)
+
+    result = worker.crawl_and_enqueue(
+        "https://www.jw.org/en/library/bible/study-bible/books/john/3/", "job", "www.jw.org",
+        respect_robots=False,
+    )
+    assert result["status"] == "excluded_path"
