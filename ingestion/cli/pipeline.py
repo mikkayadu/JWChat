@@ -463,5 +463,13 @@ def _normalise_url(url: str) -> str:
 
 
 if __name__ == "__main__":
+    from ingestion.utils.embedder import EmbeddingQuotaExhausted
+
     args = parse_args()
-    run_pipeline(args)
+    try:
+        run_pipeline(args)
+    except EmbeddingQuotaExhausted:
+        # --sync mode embeds in this process; with Celery the worker handles it.
+        logger.error("Gemini embedding quota exhausted — stopping. Run again after it "
+                     "resets; pages already in Pinecone are skipped.")
+        sys.exit(1)

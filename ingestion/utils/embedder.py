@@ -25,6 +25,54 @@ _ERROR_TEXT_MARKERS = [
 ]
 
 
+# Per-minute rate limits clear on their own; this many waits in a row without
+# one going through means the quota is spent (e.g. a billing cap), not busy.
+_MAX_RATE_LIMIT_WAITS = 5
+
+
+class EmbeddingQuotaExhausted(RuntimeError):
+    """Gemini refused to embed because the quota is used up. Retrying before
+    it resets only wastes work, so ingestion should stop."""
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    from google.api_core.exceptions import TooManyRequests
+
+    return isinstance(e, TooManyRequests) or "RESOURCE_EXHAUSTED" in str(e)
+
+
+def _retry_delay_seconds(e: Exception) -> float:
+    """The wait Gemini suggests in a 429 ("retry_delay { seconds: 22 }" or
+    "Please retry in 22.3s"), else a minute."""
+    text = str(e)
+    match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", text) or re.search(
+        r"retry in ([\d.]+)s", text
+    )
+    return float(match.group(1)) + 1 if match else 60.0
+
+
+def _embed_content(genai, model: str, text: str):
+    """genai.embed_content, waiting out per-minute rate limits. Raises
+    EmbeddingQuotaExhausted when a daily quota is spent, or when the limit
+    doesn't clear after several waits."""
+    for waits in range(_MAX_RATE_LIMIT_WAITS + 1):
+        try:
+            return genai.embed_content(
+                model=model,
+                content=text,
+                task_type="retrieval_document",
+                output_dimensionality=768,
+            )
+        except Exception as e:
+            if not _is_rate_limit_error(e):
+                raise
+            if "PerDay" in str(e) or waits == _MAX_RATE_LIMIT_WAITS:
+                raise EmbeddingQuotaExhausted(str(e)) from e
+            delay = _retry_delay_seconds(e)
+            logger.warning(f"Gemini rate limit hit — waiting {delay:.0f}s before retrying")
+            time.sleep(delay)
+
+
 def _is_low_quality_error_chunk(text: str) -> bool:
     normalized = (text or "").strip().lower()
     if not normalized:
@@ -122,12 +170,7 @@ def embed_chunks(
             success = False
             for attempt in range(3):
                 try:
-                    response = genai.embed_content(
-                        model=model,
-                        content=chunk.text,
-                        task_type="retrieval_document",
-                        output_dimensionality=768,
-                    )
+                    response = _embed_content(genai, model, chunk.text)
                     vector = response["embedding"]
                     if target_dim > 0 and len(vector) != target_dim:
                         if not resize_logged:
@@ -139,6 +182,10 @@ def embed_chunks(
                     results.append({"chunk": chunk, "vector": vector})
                     success = True
                     break
+                except EmbeddingQuotaExhausted:
+                    # Drop the whole page rather than store part of it: the
+                    # skip-if-ingested check would never fill in the rest.
+                    raise
                 except Exception as e:
                     wait = 2 ** attempt
                     logger.warning(

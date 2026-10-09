@@ -25,6 +25,8 @@ from dotenv import load_dotenv
 # (Celery's temporary entry), and a "not in sys.path" guard would skip it.
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
+from ingestion.utils.embedder import EmbeddingQuotaExhausted
+
 load_dotenv()
 
 # billiard starts pool processes with "spawn" on macOS, and Celery only sets up
@@ -123,6 +125,19 @@ def _embed_and_store(chunks, language: str = "en"):
     return len(embedded)
 
 
+def _pause_for_quota(task, *args, **kwargs):
+    """Gemini's embedding quota is spent: put this item back on the queue and
+    shut the worker down. Everything still queued waits in Redis, so starting
+    the worker again once the quota resets carries on where this stopped."""
+    task.apply_async(args=args, kwargs=kwargs)
+    logger.error(
+        "Gemini embedding quota exhausted — shutting down the worker. Queued jobs "
+        "are kept in Redis; restart the worker after the quota resets "
+        "(daily limits reset at midnight Pacific time)."
+    )
+    app.control.shutdown()
+
+
 def _already_ingested(source: str, language: str) -> bool:
     from ingestion.utils.embedder import source_exists
 
@@ -177,6 +192,10 @@ def ingest_pdf(self, file_path: str, language: str | None = None):
         logger.success(f"[PDF] Done: {file_path} → {count} vectors")
         return {"file": file_path, "vectors": count}
 
+    except EmbeddingQuotaExhausted:
+        _pause_for_quota(ingest_pdf, file_path, language=language)
+        return {"file": file_path, "vectors": 0, "status": "quota_exhausted"}
+
     except Exception as e:
         logger.error(f"[PDF] Failed: {file_path}: {e}")
         raise self.retry(exc=e)
@@ -218,6 +237,10 @@ def ingest_url(self, url: str, use_playwright: bool = True, language: str | None
         count = _embed_and_store(chunks, lang)
         logger.success(f"[HTML] Done: {url} → {count} vectors")
         return {"url": url, "vectors": count}
+
+    except EmbeddingQuotaExhausted:
+        _pause_for_quota(ingest_url, url, use_playwright=use_playwright, language=language)
+        return {"url": url, "vectors": 0, "status": "quota_exhausted"}
 
     except Exception as e:
         logger.error(f"[HTML] Failed: {url}: {e}")
@@ -263,6 +286,12 @@ def ingest_video(
         count = _embed_and_store(chunks, lang)
         logger.success(f"[VIDEO] Done: {source} → {count} vectors")
         return {"source": source, "vectors": count}
+
+    except EmbeddingQuotaExhausted:
+        _pause_for_quota(
+            ingest_video, source, is_url=is_url, model_size=model_size, language=language
+        )
+        return {"source": source, "vectors": 0, "status": "quota_exhausted"}
 
     except Exception as e:
         logger.error(f"[VIDEO] Failed: {source}: {e}")
