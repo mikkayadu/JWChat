@@ -97,6 +97,10 @@ def _crawl_failed_key(job_id: str) -> str:
     return f"crawl:{job_id}:failed"
 
 
+def _crawl_queued_key(job_id: str) -> str:
+    return f"crawl:{job_id}:queued"
+
+
 def _ttl_seconds() -> int:
     return int(os.getenv("CRAWL_JOB_TTL_SECONDS", "86400"))
 
@@ -353,8 +357,15 @@ def crawl_and_enqueue(
             path_prefix,
         )
 
+        queued_key = _crawl_queued_key(job_id)
         queued_children = 0
         for link in links:
+            # Pages share most of their links (navigation, footers), so queue
+            # each URL once per job: deduping only when a task runs left ~175
+            # duplicate tasks per crawled page sitting in Redis.
+            dedupe_key = link if _is_video_page_url(link) else _normalise(link)
+            if not redis_client.sadd(queued_key, dedupe_key):
+                continue
             crawl_and_enqueue.delay(
                 link,
                 job_id,
@@ -368,6 +379,7 @@ def crawl_and_enqueue(
                 language=language,
             )
             queued_children += 1
+        redis_client.expire(queued_key, ttl_seconds)
 
         logger.info(
             f"[CRAWL] {canonical_url} | pages={pages}/{max_pages} | children_queued={queued_children}"
