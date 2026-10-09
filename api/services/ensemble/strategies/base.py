@@ -1,8 +1,8 @@
 """Shared interface and utilities for ensemble reasoning strategies.
 
 Every strategy ultimately funnels its reasoning into the same cited-answer
-shape — plain prose with inline ``[n]`` citations and a trailing "Sources:"
-section, matching ``ChatService._answer_prompt`` — so the orchestrator's
+shape — plain prose with inline ``[n]`` citations and no trailing source list,
+matching ``ChatService._answer_prompt`` — so the orchestrator's
 embedding-based majority vote compares like-for-like text. Strategies that
 returned differently-shaped output (one its reasoning trace, another a terse
 answer) would skew that comparison.
@@ -35,7 +35,7 @@ CITATION_RULES = (
     "- Be concise and direct.\n"
     "- Place citations immediately after the sentence they support.\n"
     "- If multiple sources support a point, list all relevant citations: [1][3].\n"
-    "- End with a 'Sources:' section listing each cited reference by number."
+    "- Do not append a list of the sources at the end of your response."
 )
 
 
