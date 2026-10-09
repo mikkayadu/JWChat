@@ -341,7 +341,11 @@ def _sync_pdf(source: str, language: str | None = None):
         return
 
     pages = extract_pdf(source)  # handles URLs automatically
-    chunks = chunk_pages(pages)
+    chunks = chunk_pages(
+        pages,
+        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
+        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
+    )
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
@@ -371,7 +375,13 @@ def _sync_html(url: str, language: str | None = None):
         return
 
     page = preprocess(page)
-    chunks = chunk_text(page.text, source=url, metadata=page.metadata)
+    chunks = chunk_text(
+        page.text,
+        source=url,
+        metadata=page.metadata,
+        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
+        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
+    )
     chunks = enrich_chunks_with_context(chunks, title=page.title or url, full_text=page.text)
     embedded = embed_chunks(
         chunks,
@@ -402,7 +412,13 @@ def _sync_video(source: str, model_size: str = "base", language: str | None = No
 
     if not result:
         return
-    chunks = chunk_text(result.transcript, source=source, metadata=result.metadata)
+    chunks = chunk_text(
+        result.transcript,
+        source=source,
+        metadata=result.metadata,
+        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
+        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
+    )
     embedded = embed_chunks(
         chunks,
         api_key=os.getenv("GEMINI_API_KEY"),
