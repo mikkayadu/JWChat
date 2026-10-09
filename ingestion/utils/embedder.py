@@ -217,6 +217,12 @@ def embed_chunks(
     return results
 
 
+# Index handles by name, reused for the life of the process: checking the
+# index exists (list_indexes) takes about a second, and ingestion asks for the
+# index twice per page.
+_indexes: dict = {}
+
+
 def init_collection(
     host: str = "",
     port: int = 0,
@@ -229,11 +235,14 @@ def init_collection(
     """
     from pinecone import Pinecone, ServerlessSpec
 
+    index_name = os.getenv("PINECONE_INDEX", collection_name)
+    if index_name in _indexes:
+        return _indexes[index_name]
+
     api_key = os.getenv("PINECONE_API_KEY")
     if not api_key:
         raise ValueError("Missing PINECONE_API_KEY")
 
-    index_name = os.getenv("PINECONE_INDEX", collection_name)
     cloud = os.getenv("PINECONE_CLOUD", "aws")
     region = os.getenv("PINECONE_REGION", "us-east-1")
     dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", vector_size))
@@ -252,7 +261,8 @@ def init_collection(
     else:
         logger.info(f"Pinecone index '{index_name}' already exists")
 
-    return pc.Index(index_name)
+    _indexes[index_name] = pc.Index(index_name)
+    return _indexes[index_name]
 
 
 def upsert_embeddings(
