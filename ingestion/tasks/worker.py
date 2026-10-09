@@ -13,10 +13,24 @@ Then submit jobs from pipeline.py or any Python script.
 from celery import Celery
 from loguru import logger
 import os
+import sys
 import time
+from pathlib import Path
 from dotenv import load_dotenv
 
+# Celery puts the working directory on sys.path only while it imports this
+# module, so pool processes later fail on top-level modules like `languages`.
+# Append unconditionally: during that import the root is already on the path
+# (Celery's temporary entry), and a "not in sys.path" guard would skip it.
+sys.path.append(str(Path(__file__).resolve().parents[2]))
+
 load_dotenv()
+
+# billiard starts pool processes with "spawn" on macOS, and Celery only sets up
+# the per-process task state that spawned children need when this is set —
+# without it every task fails with "not enough values to unpack (expected 3,
+# got 0)". Pool processes inherit it from the main process.
+os.environ.setdefault("FORKED_BY_MULTIPROCESSING", "1")
 
 # ── App Setup ────────────────────────────────────────────────────────────────
 
