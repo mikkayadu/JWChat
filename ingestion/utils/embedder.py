@@ -14,11 +14,12 @@ from loguru import logger
 from ingestion.utils.chunker import TextChunk
 
 
+# Only phrases that don't occur in article prose: "forbidden" did ("the
+# forbidden fruit"), and every chunk using it was dropped.
 _ERROR_TEXT_MARKERS = [
     "error: the request could not be satisfied",
     "cloudfront",
     "access denied",
-    "forbidden",
     "request blocked",
     "verify you are human",
     "captcha",

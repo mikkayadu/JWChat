@@ -59,6 +59,11 @@ _ERROR_TEXT_MARKERS = [
 _MIN_TEXT_CHARS = 180
 _MIN_WORD_COUNT = 30
 
+# Error, block and consent pages are short. Articles use the same words in
+# passing ("the forbidden fruit", "is not found in the Bible"), so the error
+# markers only count on pages shorter than this.
+_MAX_ERROR_PAGE_WORDS = 180
+
 _DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -260,14 +265,13 @@ def _should_skip_page(title: str, text: str, status_code: int | None) -> bool:
 
     title_text = (title or "").strip()
     normalized_text = (text or "").strip().lower()
-
-    sample = normalized_text[:6000]
-    if any(marker in sample for marker in _ERROR_TEXT_MARKERS):
-        return True
-
     word_count = len(re.findall(r"\b\w+\b", normalized_text))
-    if _ERROR_TITLE_PATTERNS.search(title_text) and word_count < 180:
-        return True
+
+    if word_count < _MAX_ERROR_PAGE_WORDS:
+        if any(marker in normalized_text for marker in _ERROR_TEXT_MARKERS):
+            return True
+        if _ERROR_TITLE_PATTERNS.search(title_text):
+            return True
 
     if len(normalized_text) < _MIN_TEXT_CHARS and word_count < _MIN_WORD_COUNT:
         return True
