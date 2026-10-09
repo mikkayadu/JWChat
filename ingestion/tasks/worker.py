@@ -11,6 +11,7 @@ Then submit jobs from pipeline.py or any Python script.
 """
 
 from celery import Celery
+from kombu import Queue
 from loguru import logger
 import os
 import sys
@@ -34,6 +35,11 @@ os.environ.setdefault("FORKED_BY_MULTIPROCESSING", "1")
 
 # ── App Setup ────────────────────────────────────────────────────────────────
 
+# Kombu's Redis transport keeps consumed queues in a set, so declared order is
+# lost; the "sorted" strategy polls them alphabetically instead, and the "0-"
+# prefix sorts this queue ahead of the "celery" crawl queue.
+INGEST_QUEUE = "0-ingest"
+
 app = Celery(
     "rag_ingestion",
     broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
@@ -48,7 +54,16 @@ app.conf.update(
     task_acks_late=True,           # re-queue if worker crashes mid-task
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,  # don't grab too many tasks at once
-    broker_transport_options={"visibility_timeout": 3600},
+    # Ingest tasks get their own queue, checked before the crawl queue. Each
+    # crawled page queues ~20 crawl tasks but one ingest task, so in a shared
+    # queue pages waited behind thousands of crawl tasks.
+    task_queues=(Queue(INGEST_QUEUE), Queue("celery")),
+    task_routes={
+        "ingestion.tasks.worker.ingest_pdf": {"queue": INGEST_QUEUE},
+        "ingestion.tasks.worker.ingest_url": {"queue": INGEST_QUEUE},
+        "ingestion.tasks.worker.ingest_video": {"queue": INGEST_QUEUE},
+    },
+    broker_transport_options={"visibility_timeout": 3600, "queue_order_strategy": "sorted"},
     result_expires=3600,
 )
 
