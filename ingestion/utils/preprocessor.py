@@ -41,7 +41,9 @@ _BOILERPLATE_RE = re.compile(
     r"you\s+might\s+also\s+like|recommended|advertisement|"
     r"skip\s+to\s+(content|main\s+content)|"
     r"cookie\s+policy|privacy\s+policy|terms\s+of\s+(use|service)|"
-    r"all\s+rights\s+reserved|copyright|©|\d+"
+    r"all\s+rights\s+reserved|copyright|©|\d+|"
+    # Ends older jw.org magazine articles; points readers to the print layout.
+    r"\(for\s+fully\s+formatted\s+text,\s+see\s+publication\)"
     r")$",
     re.IGNORECASE,
 )

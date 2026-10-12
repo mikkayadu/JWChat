@@ -37,6 +37,11 @@ def test_short_scripture_line_survives_boilerplate_filter():
     assert remove_boilerplate_lines("Exodus 20:3\nShare\nPrint") == "Exodus 20:3"
 
 
+def test_fully_formatted_text_note_is_removed():
+    text = "Paul preached in Antioch for a whole year.\n(For fully formatted text, see publication)"
+    assert remove_boilerplate_lines(text) == "Paul preached in Antioch for a whole year."
+
+
 def test_footnote_letters_are_removed():
     text = _text(
         f"<p>{_FILLER}</p>"
