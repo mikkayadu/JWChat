@@ -203,3 +203,5 @@ pyrightconfig.json
 *.tmp
 .tmp/
 .claude
+# Written during ingestion; rebuild with: python -m scripts.ingest_stats --out ingested_urls.txt
+ingested_urls.txt

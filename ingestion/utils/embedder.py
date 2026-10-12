@@ -12,6 +12,7 @@ import uuid
 import re
 from loguru import logger
 from ingestion.utils.chunker import TextChunk
+from ingestion.utils.ingested_urls import record_ingested
 
 
 # Only phrases that don't occur in article prose: "forbidden" did ("the
@@ -330,6 +331,7 @@ def upsert_embeddings(
         logger.debug(f"Upserted batch {i // batch_size + 1} ({len(batch)} points)")
 
     logger.success(f"Done: {len(filtered_embedded)} vectors in '{collection_name}'")
+    record_ingested(item["chunk"].source for item in filtered_embedded)
 
 
 def source_exists(client, source: str, language: str = "en") -> bool:
