@@ -155,12 +155,13 @@ class IntentScores(BaseModel):
     out_of_domain_score: float = Field(ge=0.0, le=1.0)
     # Language detection and translation ride on the classifier call that
     # already runs for every request, so the English fallback costs no extra
-    # LLM round trip. Defaults keep a model that omits them from failing.
-    detected_language: str = Field(
+    # LLM round trip. Defaults and None keep a model that omits them, or
+    # returns null for them, from failing validation.
+    detected_language: str | None = Field(
         default="",
         description="ISO 639-1 code of the question's language, e.g. 'en' or 'tw'.",
     )
-    english_query: str = Field(
+    english_query: str | None = Field(
         default="",
         description="The question translated into English; empty if it is already English.",
     )
@@ -778,7 +779,7 @@ class ChatService:
 
     @staticmethod
     def _language_fields(
-        requested: str, detected_raw: str, english_query: str, question: str
+        requested: str, detected_raw: str | None, english_query: str | None, question: str
     ) -> ChatState:
         """Resolve the answer language from the picker and the detected language.
 

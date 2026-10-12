@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import languages
-from api.services.chat_service import ChatService
+from api.services.chat_service import ChatService, IntentScores
 from api.services.ensemble import RAGEnsemble
 from api.services.ensemble.strategies.base import (
     FINAL_ANSWER_PROMPT,
@@ -341,3 +341,12 @@ def test_chat_request_language_validation(monkeypatch):
     monkeypatch.setenv("ENABLED_LANGUAGES", "en")
     with pytest.raises(ValidationError):
         ChatRequest(question="Hwan ne Yehowa?", language="tw")
+
+
+def test_null_language_fields_from_the_classifier_are_accepted():
+    scores = IntentScores(
+        greeting_score=0.0, out_of_domain_score=0.0, detected_language=None, english_query=None
+    )
+    fields = ChatService._language_fields("auto", scores.detected_language, scores.english_query, "q")
+    assert fields["answer_language"] == "en"
+    assert fields["english_query"] == "q"
