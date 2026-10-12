@@ -72,7 +72,7 @@ def main():
         all_sources += sorted(per_source)
 
     if args.out:
-        # Same format as the list ingestion keeps up to date (count header, one
+        # Same format as the list ingestion appends to (header comment, one
         # source per line), so --out ingested_urls.txt rebuilds that list.
         count = write_ingested_urls(all_sources, Path(args.out))
         print(f"Wrote {count} sources to {args.out}")
