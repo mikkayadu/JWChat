@@ -964,9 +964,9 @@ class ChatService:
     ) -> list[tuple[Document, float]]:
         """Embed query and fetch top-k matches from ``lang``'s namespace above its min score."""
         query_vector = self._embeddings.embed_query(query)
-        # English lives in the legacy default namespace; omit the kwarg for it.
-        namespace_kwargs = {"namespace": lang.namespace} if lang.namespace else {}
-        result = self._index.query(vector=query_vector, top_k=k, include_metadata=True, **namespace_kwargs)
+        result = self._index.query(
+            vector=query_vector, top_k=k, include_metadata=True, **lang.namespace_kwargs
+        )
         matches = result.get("matches", [])
         min_score = lang.min_score if lang.min_score is not None else self._read_min_score()
 

@@ -45,6 +45,13 @@ class Language:
     bm25_fold: dict[str, str] = field(default_factory=dict)  # folded before BM25 tokenising
     aliases: tuple[str, ...] = ()     # other codes a detector may return ("ak", "twi")
 
+    @property
+    def namespace_kwargs(self) -> dict[str, str]:
+        """Keyword arguments selecting this language's Pinecone namespace.
+        English lives in the legacy default namespace, so the kwarg is omitted
+        for it rather than passing ""."""
+        return {"namespace": self.namespace} if self.namespace else {}
+
 
 # Scraped from https://www.jw.org/en/library/bible/study-bible/books/
 _EN_BOOKS = (

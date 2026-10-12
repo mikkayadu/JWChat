@@ -114,7 +114,6 @@ def run_retrieval(items: list[dict], lang: languages.Language, k: int, fetch_k: 
     index = Pinecone(api_key=os.environ["PINECONE_API_KEY"]).Index(
         os.getenv("PINECONE_INDEX", "website-rag")
     )
-    namespace_kwargs = {"namespace": lang.namespace} if lang.namespace else {}
 
     ranks: list[int | None] = []
     top1_scores: list[float] = []
@@ -123,7 +122,7 @@ def run_retrieval(items: list[dict], lang: languages.Language, k: int, fetch_k: 
 
     for item in items:
         vector = embeddings.embed_query(item["question"])
-        result = index.query(vector=vector, top_k=fetch_k, include_metadata=True, **namespace_kwargs)
+        result = index.query(vector=vector, top_k=fetch_k, include_metadata=True, **lang.namespace_kwargs)
         matches = result.get("matches", [])
         urls = [_source_url(m.get("metadata") or {}) for m in matches]
         scores = [float(m.get("score") or 0.0) for m in matches]

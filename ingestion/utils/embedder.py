@@ -301,9 +301,6 @@ def upsert_embeddings(
         f"Upserting {len(filtered_embedded)} vectors into Pinecone "
         f"(language={lang.code}, namespace='{lang.namespace}')..."
     )
-    # English stays in the legacy default namespace: omit the kwarg rather than
-    # pass "" so the existing upsert call is unchanged for it.
-    namespace_kwargs = {"namespace": lang.namespace} if lang.namespace else {}
 
     for i in range(0, len(filtered_embedded), batch_size):
         batch = filtered_embedded[i : i + batch_size]
@@ -327,7 +324,7 @@ def upsert_embeddings(
 
             vectors.append({"id": point_id, "values": vector, "metadata": metadata})
 
-        client.upsert(vectors=vectors, **namespace_kwargs)
+        client.upsert(vectors=vectors, **lang.namespace_kwargs)
         logger.debug(f"Upserted batch {i // batch_size + 1} ({len(batch)} points)")
 
     logger.success(f"Done: {len(filtered_embedded)} vectors in '{collection_name}'")
@@ -343,7 +340,6 @@ def source_exists(client, source: str, language: str = "en") -> bool:
     import languages
 
     lang = languages.get(language)
-    namespace_kwargs = {"namespace": lang.namespace} if lang.namespace else {}
     dimensions = int(os.getenv("EMBEDDING_DIMENSIONS", 768))
     # Only the metadata filter matters; any non-zero vector of the index size works.
     probe = [1.0] + [0.0] * (dimensions - 1)
@@ -355,7 +351,7 @@ def source_exists(client, source: str, language: str = "en") -> bool:
             filter={"source": {"$eq": source}},
             include_values=False,
             include_metadata=False,
-            **namespace_kwargs,
+            **lang.namespace_kwargs,
         )
     except Exception as e:
         logger.warning(f"Pinecone lookup failed for {source}: {e} — ingesting anyway")
