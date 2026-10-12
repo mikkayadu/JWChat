@@ -327,104 +327,19 @@ def _ingest_discovered_urls(
 # ── Sync (no Celery) helpers ──────────────────────────────────────────────────
 
 def _sync_pdf(source: str, language: str | None = None):
-    from ingestion.extractors.pdf_extractor import extract_pdf
-    from ingestion.utils.chunker import chunk_pages
-    from ingestion.utils.embedder import (
-        embed_chunks, upsert_embeddings, init_collection, source_exists,
-    )
-    import os
-
-    lang = languages.resolve_ingest_language(source, language).code
-    client = init_collection()
-    if source_exists(client, source, lang):
-        logger.info(f"[PDF][sync] Skipped (already in Pinecone): {source}")
-        return
-
-    pages = extract_pdf(source)  # handles URLs automatically
-    chunks = chunk_pages(
-        pages,
-        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
-        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
-    )
-    embedded = embed_chunks(
-        chunks,
-        api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
-    )
-    upsert_embeddings(embedded, client, language=lang)
+    from ingestion.tasks.worker import process_pdf
+    process_pdf(source, language)
 
 
 def _sync_html(url: str, language: str | None = None):
-    from ingestion.extractors.html_scraper import scrape_url
-    from ingestion.utils.chunker import chunk_text
-    from ingestion.utils.embedder import (
-        embed_chunks, upsert_embeddings, init_collection, source_exists,
-    )
-    from ingestion.utils.preprocessor import preprocess, enrich_chunks_with_context
-    import os
-
-    lang = languages.resolve_ingest_language(url, language).code
-    client = init_collection()
-    if source_exists(client, url, lang):
-        logger.info(f"[HTML][sync] Skipped (already in Pinecone): {url}")
-        return
-
-    page = scrape_url(url, language=lang)
-    if not page:
-        logger.warning(f"[HTML][sync] Skipped: {url} (scrape failed or page deemed non-content/error)")
-        return
-
-    page = preprocess(page)
-    chunks = chunk_text(
-        page.text,
-        source=url,
-        metadata=page.metadata,
-        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
-        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
-    )
-    chunks = enrich_chunks_with_context(chunks, title=page.title or url, full_text=page.text)
-    embedded = embed_chunks(
-        chunks,
-        api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
-    )
-    upsert_embeddings(embedded, client, language=lang)
+    from ingestion.tasks.worker import process_url
+    process_url(url, language=language)
 
 
 def _sync_video(source: str, model_size: str = "base", language: str | None = None):
-    from ingestion.extractors.video_transcriber import transcribe_file, transcribe_url
-    from ingestion.utils.chunker import chunk_text
-    from ingestion.utils.embedder import (
-        embed_chunks, upsert_embeddings, init_collection, source_exists,
-    )
-    import os
-
-    lang = languages.resolve_ingest_language(source, language).code
-    client = init_collection()
-    if source_exists(client, source, lang):
-        logger.info(f"[VIDEO][sync] Skipped (already in Pinecone): {source}")
-        return
-
-    if source.startswith("http://") or source.startswith("https://"):
-        result = transcribe_url(source, model_size)
-    else:
-        result = transcribe_file(source, model_size)
-
-    if not result:
-        return
-    chunks = chunk_text(
-        result.transcript,
-        source=source,
-        metadata=result.metadata,
-        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
-        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
-    )
-    embedded = embed_chunks(
-        chunks,
-        api_key=os.getenv("GEMINI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
-    )
-    upsert_embeddings(embedded, client, language=lang)
+    from ingestion.tasks.worker import process_video
+    is_url = source.startswith("http://") or source.startswith("https://")
+    process_video(source, is_url=is_url, model_size=model_size, language=language)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

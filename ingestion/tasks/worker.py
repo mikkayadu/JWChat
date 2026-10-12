@@ -167,30 +167,114 @@ def _queue_media_ingestion(url: str, language: str | None = None):
     return "unknown"
 
 
+# ── Ingestion ─────────────────────────────────────────────────────────────────
+# One body per source type, shared by the Celery tasks below and by
+# ``pipeline.py --sync``. Errors propagate: the tasks retry or pause on them,
+# --sync stops on them.
+
+def process_pdf(file_path: str, language: str | None = None) -> dict:
+    """Ingest a single PDF file. ``language`` overrides the URL's language."""
+    from ingestion.extractors.pdf_extractor import extract_pdf
+    from ingestion.utils.chunker import chunk_pages
+
+    lang = _resolve_language(file_path, language)
+    if _already_ingested(file_path, lang):
+        logger.info(f"[PDF] Skipped (already in Pinecone): {file_path}")
+        return {"file": file_path, "vectors": 0, "status": "already_ingested"}
+
+    logger.info(f"[PDF] Starting: {file_path}")
+    pages = extract_pdf(file_path)
+    chunks = chunk_pages(
+        pages,
+        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
+        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
+    )
+    count = _embed_and_store(chunks, lang)
+    logger.success(f"[PDF] Done: {file_path} → {count} vectors")
+    return {"file": file_path, "vectors": count}
+
+
+def process_url(url: str, use_playwright: bool = True, language: str | None = None) -> dict:
+    """Scrape and ingest a single HTML page. ``language`` overrides the URL's language."""
+    from ingestion.extractors.crawler import _is_excluded_url
+    from ingestion.extractors.html_scraper import scrape_url
+    from ingestion.utils.chunker import chunk_text
+    from ingestion.utils.preprocessor import preprocess, enrich_chunks_with_context
+
+    if _is_excluded_url(url):
+        logger.info(f"[HTML] Skipped (excluded): {url}")
+        return {"url": url, "vectors": 0, "error": "excluded_path"}
+
+    lang = _resolve_language(url, language)
+    if _already_ingested(url, lang):
+        logger.info(f"[HTML] Skipped (already in Pinecone): {url}")
+        return {"url": url, "vectors": 0, "status": "already_ingested"}
+
+    logger.info(f"[HTML] Starting: {url} (language={lang})")
+    page = scrape_url(url, use_playwright=use_playwright, language=lang)
+    if not page:
+        logger.warning(f"[HTML] Skipped: {url} (scrape failed or page deemed non-content/error)")
+        return {"url": url, "vectors": 0, "error": "invalid_or_error_page"}
+
+    page = preprocess(page)
+    chunks = chunk_text(
+        page.text,
+        source=url,
+        metadata=page.metadata,
+        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
+        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
+    )
+    chunks = enrich_chunks_with_context(chunks, title=page.title or url, full_text=page.text)
+    count = _embed_and_store(chunks, lang)
+    logger.success(f"[HTML] Done: {url} → {count} vectors")
+    return {"url": url, "vectors": count}
+
+
+def process_video(
+    source: str,
+    is_url: bool = False,
+    model_size: str = "base",
+    language: str | None = None,
+) -> dict:
+    """Transcribe and ingest a video file or URL. ``language`` overrides the URL's language."""
+    from ingestion.utils.chunker import chunk_text
+
+    lang = _resolve_language(source, language)
+    if _already_ingested(source, lang):
+        logger.info(f"[VIDEO] Skipped (already in Pinecone): {source}")
+        return {"source": source, "vectors": 0, "status": "already_ingested"}
+
+    logger.info(f"[VIDEO] Starting: {source}")
+
+    if is_url:
+        from ingestion.extractors.video_transcriber import transcribe_url
+        result = transcribe_url(source, model_size=model_size, language=lang)
+    else:
+        from ingestion.extractors.video_transcriber import transcribe_file
+        result = transcribe_file(source, model_size=model_size, language=lang)
+
+    if not result:
+        return {"source": source, "vectors": 0, "error": "transcription failed"}
+
+    chunks = chunk_text(
+        result.transcript,
+        source=source,
+        metadata=result.metadata,
+        chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
+        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
+    )
+    count = _embed_and_store(chunks, lang)
+    logger.success(f"[VIDEO] Done: {source} → {count} vectors")
+    return {"source": source, "vectors": count}
+
+
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 
 @app.task(bind=True, max_retries=3, default_retry_delay=10)
 def ingest_pdf(self, file_path: str, language: str | None = None):
     """Ingest a single PDF file. ``language`` overrides the URL's language."""
     try:
-        from ingestion.extractors.pdf_extractor import extract_pdf
-        from ingestion.utils.chunker import chunk_pages
-
-        lang = _resolve_language(file_path, language)
-        if _already_ingested(file_path, lang):
-            logger.info(f"[PDF] Skipped (already in Pinecone): {file_path}")
-            return {"file": file_path, "vectors": 0, "status": "already_ingested"}
-
-        logger.info(f"[PDF] Starting: {file_path}")
-        pages = extract_pdf(file_path)
-        chunks = chunk_pages(
-            pages,
-            chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
-            chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
-        )
-        count = _embed_and_store(chunks, lang)
-        logger.success(f"[PDF] Done: {file_path} → {count} vectors")
-        return {"file": file_path, "vectors": count}
+        return process_pdf(file_path, language)
 
     except EmbeddingQuotaExhausted:
         _pause_for_quota(ingest_pdf, file_path, language=language)
@@ -205,38 +289,7 @@ def ingest_pdf(self, file_path: str, language: str | None = None):
 def ingest_url(self, url: str, use_playwright: bool = True, language: str | None = None):
     """Scrape and ingest a single HTML page. ``language`` overrides the URL's language."""
     try:
-        from ingestion.extractors.crawler import _is_excluded_url
-        from ingestion.extractors.html_scraper import scrape_url
-        from ingestion.utils.chunker import chunk_text
-        from ingestion.utils.preprocessor import preprocess, enrich_chunks_with_context
-
-        if _is_excluded_url(url):
-            logger.info(f"[HTML] Skipped (excluded): {url}")
-            return {"url": url, "vectors": 0, "error": "excluded_path"}
-
-        lang = _resolve_language(url, language)
-        if _already_ingested(url, lang):
-            logger.info(f"[HTML] Skipped (already in Pinecone): {url}")
-            return {"url": url, "vectors": 0, "status": "already_ingested"}
-
-        logger.info(f"[HTML] Starting: {url} (language={lang})")
-        page = scrape_url(url, use_playwright=use_playwright, language=lang)
-        if not page:
-            logger.warning(f"[HTML] Skipped: {url} (scrape failed or page deemed non-content/error)")
-            return {"url": url, "vectors": 0, "error": "invalid_or_error_page"}
-
-        page = preprocess(page)
-        chunks = chunk_text(
-            page.text,
-            source=url,
-            metadata=page.metadata,
-            chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
-            chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
-        )
-        chunks = enrich_chunks_with_context(chunks, title=page.title or url, full_text=page.text)
-        count = _embed_and_store(chunks, lang)
-        logger.success(f"[HTML] Done: {url} → {count} vectors")
-        return {"url": url, "vectors": count}
+        return process_url(url, use_playwright, language)
 
     except EmbeddingQuotaExhausted:
         _pause_for_quota(ingest_url, url, use_playwright=use_playwright, language=language)
@@ -257,35 +310,7 @@ def ingest_video(
 ):
     """Transcribe and ingest a video file or URL. ``language`` overrides the URL's language."""
     try:
-        from ingestion.utils.chunker import chunk_text
-
-        lang = _resolve_language(source, language)
-        if _already_ingested(source, lang):
-            logger.info(f"[VIDEO] Skipped (already in Pinecone): {source}")
-            return {"source": source, "vectors": 0, "status": "already_ingested"}
-
-        logger.info(f"[VIDEO] Starting: {source}")
-
-        if is_url:
-            from ingestion.extractors.video_transcriber import transcribe_url
-            result = transcribe_url(source, model_size=model_size)
-        else:
-            from ingestion.extractors.video_transcriber import transcribe_file
-            result = transcribe_file(source, model_size=model_size)
-
-        if not result:
-            return {"source": source, "vectors": 0, "error": "transcription failed"}
-
-        chunks = chunk_text(
-            result.transcript,
-            source=source,
-            metadata=result.metadata,
-            chunk_size=int(os.getenv("CHUNK_SIZE", 400)),
-            chunk_overlap=int(os.getenv("CHUNK_OVERLAP", 80)),
-        )
-        count = _embed_and_store(chunks, lang)
-        logger.success(f"[VIDEO] Done: {source} → {count} vectors")
-        return {"source": source, "vectors": count}
+        return process_video(source, is_url, model_size, language)
 
     except EmbeddingQuotaExhausted:
         _pause_for_quota(
