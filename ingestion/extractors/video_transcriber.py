@@ -29,9 +29,15 @@ class TranscribedVideo:
     metadata: dict = field(default_factory=dict)
 
 
-def transcribe_file(file_path: str | Path, model_size: str = "base") -> TranscribedVideo | None:
+def transcribe_file(
+    file_path: str | Path,
+    model_size: str = "base",
+    language: str | None = None,
+) -> TranscribedVideo | None:
     """
     Transcribe a local video or audio file using Whisper.
+    ``language`` is the registry code the file is ingested under; files in a
+    language Whisper can't transcribe (e.g. Twi) are skipped.
 
     model_size options (speed vs accuracy):
       "tiny"   — fastest, lower accuracy
@@ -42,11 +48,15 @@ def transcribe_file(file_path: str | Path, model_size: str = "base") -> Transcri
     """
     # Transparently handle URLs passed here too
     if str(file_path).startswith("http://") or str(file_path).startswith("https://"):
-        return transcribe_url(str(file_path), model_size)
+        return transcribe_url(str(file_path), model_size, language)
 
     path = Path(file_path)
     if not path.exists():
         logger.error(f"File not found: {path}")
+        return None
+
+    if not _whisper_supports(language):
+        logger.warning(f"Whisper doesn't support '{language}' — skipping: {path}")
         return None
 
     logger.info(f"Transcribing: {path.name} (model={model_size})")
@@ -86,9 +96,16 @@ def transcribe_file(file_path: str | Path, model_size: str = "base") -> Transcri
         return None
 
 
-def transcribe_url(url: str, model_size: str = "base") -> TranscribedVideo | None:
+def transcribe_url(
+    url: str,
+    model_size: str = "base",
+    language: str | None = None,
+) -> TranscribedVideo | None:
     """
     Transcribe a video/audio from any URL — no manual downloading needed.
+    ``language`` is the registry code the video is ingested under; Whisper is
+    never run for a language it can't transcribe (e.g. Twi), whether that
+    comes from ``language`` or from a jw.org URL.
 
     Supports:
       - JW.org hash-routed pages: https://www.jw.org/en/library/videos/#en/mediaitems/...
@@ -124,7 +141,7 @@ def transcribe_url(url: str, model_size: str = "base") -> TranscribedVideo | Non
 
             # Whisper has no model for some languages (e.g. Twi) and would
             # produce a garbage transcript, so those videos need VTT subtitles.
-            if not jworg["whisper"]:
+            if not jworg["whisper"] or not _whisper_supports(language):
                 logger.warning(
                     f"[JW.org] No VTT and Whisper doesn't support '{jworg['language']}' — skipping: {url}"
                 )
@@ -135,7 +152,7 @@ def transcribe_url(url: str, model_size: str = "base") -> TranscribedVideo | Non
                 logger.info(f"[JW.org] No VTT — downloading MP4 for Whisper: {jworg['mp4_url']}")
                 audio_path = _download_direct(jworg["mp4_url"], tmp_dir)
                 if audio_path:
-                    result = transcribe_file(audio_path, model_size)
+                    result = transcribe_file(audio_path, model_size, language)
                     if result:
                         result.source = url
                         result.title = jworg["title"] or _title_from_url(url)
@@ -145,7 +162,11 @@ def transcribe_url(url: str, model_size: str = "base") -> TranscribedVideo | Non
             logger.error(f"JW.org mediator returned no usable URL for: {url}")
             return None
 
-        # Non-JW.org URLs: direct file or yt-dlp.
+        # Non-JW.org URLs: direct file or yt-dlp. Check before downloading.
+        if not _whisper_supports(language):
+            logger.warning(f"Whisper doesn't support '{language}' — skipping: {url}")
+            return None
+
         if _is_direct_media_url(url):
             audio_path = _download_direct(url, tmp_dir)
             if not audio_path:
@@ -158,7 +179,7 @@ def transcribe_url(url: str, model_size: str = "base") -> TranscribedVideo | Non
             logger.error(f"Could not download audio from: {url}")
             return None
 
-        result = transcribe_file(audio_path, model_size)
+        result = transcribe_file(audio_path, model_size, language)
         if result:
             result.source = url
             result.title = _title_from_url(url)
@@ -198,6 +219,15 @@ def transcribe_directory(
 
 
 # ── Internals ─────────────────────────────────────────────────────────────────
+
+def _whisper_supports(language: str | None) -> bool:
+    """False for a registered language Whisper has no model for (e.g. Twi).
+    No language, or an unregistered one, leaves it to Whisper's detection."""
+    import languages
+
+    lang = languages.LANGUAGES.get(language) if language else None
+    return lang.whisper if lang else True
+
 
 def _resolve_jworg_url(url: str) -> dict | None:
     """

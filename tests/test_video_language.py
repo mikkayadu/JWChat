@@ -77,3 +77,18 @@ def test_twi_vtt_transcript_tagged_with_language(monkeypatch):
     result = vt.transcribe_url("https://www.jw.org/tw/x/#tw/mediaitems/C/pub-a_VIDEO")
     assert result.language == "tw"
     assert result.metadata["language"] == "tw"
+
+
+def test_forced_twi_skips_whisper_for_other_urls(monkeypatch):
+    def fail(*_, **__):
+        raise AssertionError("Whisper path must not run for a video forced to Twi")
+
+    monkeypatch.setattr(vt, "_download_direct", fail)
+    monkeypatch.setattr(vt, "_download_via_ytdlp", fail)
+    assert vt.transcribe_url("https://youtube.com/watch?v=x", language="tw") is None
+
+
+def test_forced_twi_skips_whisper_for_local_files(tmp_path):
+    video = tmp_path / "talk.mp4"
+    video.write_bytes(b"")
+    assert vt.transcribe_file(video, language="tw") is None
