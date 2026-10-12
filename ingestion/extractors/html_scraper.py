@@ -75,6 +75,10 @@ _DEFAULT_USER_AGENT = (
 _DEFAULT_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 _DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 
+# Statuses that mean the page doesn't exist: a browser would get the same
+# answer, so these skip the browser fallback.
+_GONE_STATUSES = {404, 410}
+
 _CONTENT_SELECTORS = [
     "article#article",
     "article.jwac",
@@ -99,7 +103,11 @@ def scrape_url(
     set use_playwright=False to skip it.
     ``language`` overrides the language inferred from the URL.
     """
-    page = _scrape_with(_fetch_with_httpx, url, language)
+    try:
+        page = _scrape_with(_fetch_with_httpx, url, language)
+    except _PageGone as gone:
+        logger.info(f"Skipping {url}: HTTP {gone.status_code}")
+        return None
     if page is None and use_playwright:
         page = _scrape_with(_fetch_with_playwright, url, language)
     return page
@@ -113,6 +121,14 @@ def scrape_urls(urls: list[str], use_playwright: bool = True) -> list[ExtractedP
         if page and page.text:
             results.append(page)
     return results
+
+
+class _PageGone(Exception):
+    """The server says the page doesn't exist (404/410)."""
+
+    def __init__(self, status_code: int):
+        super().__init__(status_code)
+        self.status_code = status_code
 
 
 def _scrape_with(fetch, url: str, language: str | None) -> ExtractedPage | None:
@@ -151,27 +167,33 @@ def _fetch_with_playwright(url: str) -> tuple[str, int | None] | None:
             browser.close()
             logger.debug(f"Playwright fetched: {url}")
             if _is_blocked_response(html=html, status_code=status_code):
-                logger.warning(f"Playwright blocked for {url} (status={status_code}) — trying httpx")
-                return _fetch_with_httpx(url)
+                logger.warning(f"Playwright blocked for {url} (status={status_code})")
+                return None
             return html, status_code
     except Exception as e:
-        logger.warning(f"Playwright failed for {url}: {e} — trying httpx")
-        return _fetch_with_httpx(url)
+        logger.warning(f"Playwright failed for {url}: {e}")
+        return None
 
 
 def _fetch_with_httpx(url: str) -> tuple[str, int | None] | None:
-    """Lightweight fallback for static pages."""
+    """Plain HTTP fetch, tried before the browser. Raises _PageGone on 404/410;
+    other failures return None so the browser can try. Those are logged at
+    debug: the browser fallback logs if it fails too."""
+    import httpx
+
     try:
-        import httpx
-        headers = _build_default_headers()
         resp = httpx.get(url, timeout=15, follow_redirects=True,
-                         headers=headers)
-        resp.raise_for_status()
-        # Handle encoding issues gracefully
-        return _decode_response_content(resp), resp.status_code
+                         headers=_build_default_headers())
     except Exception as e:
-        logger.error(f"Failed to fetch {url}: {e}")
+        logger.debug(f"Plain HTTP fetch failed for {url}: {e}")
         return None
+    if resp.status_code in _GONE_STATUSES:
+        raise _PageGone(resp.status_code)
+    if resp.is_error:
+        logger.debug(f"Plain HTTP fetch got {resp.status_code} for {url}")
+        return None
+    # Handle encoding issues gracefully
+    return _decode_response_content(resp), resp.status_code
 
 
 def _decode_response_content(resp) -> str:

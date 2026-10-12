@@ -93,6 +93,18 @@ def test_browser_is_the_fallback(monkeypatch):
     assert scrape_url(_URL, use_playwright=False) is None
 
 
+def test_missing_page_skips_the_browser(monkeypatch):
+    def gone(url):
+        raise html_scraper._PageGone(404)
+
+    def no_browser(url):
+        raise AssertionError("the browser must not run for a page that doesn't exist")
+
+    monkeypatch.setattr(html_scraper, "_fetch_with_httpx", gone)
+    monkeypatch.setattr(html_scraper, "_fetch_with_playwright", no_browser)
+    assert scrape_url(_URL) is None
+
+
 def test_article_box_in_aside_is_kept():
     text = _text(
         f"<p>{_FILLER}</p><div class='boxSupplement'><aside><div class='boxContent'>"
