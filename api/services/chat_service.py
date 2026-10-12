@@ -1,4 +1,6 @@
+import hashlib
 import os
+import re
 from typing import TypedDict, List, Tuple, Optional
 from enum import Enum
 
@@ -58,6 +60,18 @@ _TEXT_NORMALIZATION = {
     0x2009: " ",   # thin space
     0x2011: "-",   # non-breaking hyphen
 }
+
+# The "[Source: title | Section: heading]" line ingestion puts on HTML chunks.
+_CONTEXT_HEADER_RE = re.compile(r"\A\[Source:[^\n]*\]\n")
+
+
+def _content_key(text: str) -> str:
+    """Identity of a chunk's text for retrieval dedup: the whole chunk without
+    its context header, whitespace collapsed and lowercased. The same article
+    reprinted under several URLs collapses to one key, while two passages from
+    one section stay apart even though their headers match."""
+    body = _CONTEXT_HEADER_RE.sub("", text, count=1)
+    return hashlib.sha1(" ".join(body.lower().split()).encode()).hexdigest()
 
 
 class SourcePayload(TypedDict):
@@ -916,7 +930,7 @@ class ChatService:
             hits = self._fetch_from_pinecone(query, fetch_k, lang)
             logger.info(f"[PINECONE] ns='{lang.namespace}' query='{query[:60]}...' → {len(hits)} hits passed filter")
             for doc, score in hits:
-                key = doc.page_content[:120]
+                key = _content_key(doc.page_content)
                 if key not in seen or score > seen[key][1]:
                     seen[key] = (doc, score)
 
