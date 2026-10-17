@@ -173,10 +173,11 @@ class ChatService:
         self._index_name = os.getenv("PINECONE_INDEX", "website-rag")
         self._llm_provider = os.getenv("LLM_PROVIDER", "google")
         self._embeddings_provider = os.getenv("EMBEDDINGS_PROVIDER", "google")
-        self._embedding_model = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
-        # No hardcoded default: each provider supplies its own (Gemini for google,
-        # Llama for ollama, …) when CHAT_MODEL is unset, so switching LLM_PROVIDER
-        # doesn't drag a Gemini model name onto another backend.
+        # No hardcoded defaults: the provider resolves an unset model itself
+        # (google requires CHAT_MODEL / EMBEDDING_MODEL; ollama and groq fall back
+        # to their own), so switching LLM_PROVIDER doesn't drag a Gemini model
+        # name onto another backend.
+        self._embedding_model = os.getenv("EMBEDDING_MODEL")
         self._chat_model = os.getenv("CHAT_MODEL")
         self._target_dim = self._read_target_dim()
         self._greeting_threshold = self._read_threshold("INTENT_GREETING_THRESHOLD", 0.75)

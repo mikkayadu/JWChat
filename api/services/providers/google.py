@@ -14,15 +14,22 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 
 from .registry import register_llm, register_embeddings
 
-DEFAULT_CHAT_MODEL = "gemini-2.5-flash"
-DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
-
 
 def _resolve_api_key(explicit: str | None) -> str:
     key = explicit or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) for Google models")
     return key
+
+
+def _resolve_model(explicit: str | None, env_var: str, hint: str = "") -> str:
+    # No model names in code: Google closes older models to new API keys
+    # without notice, so the choice lives in the environment where it can be
+    # changed without a deploy.
+    model = explicit or os.getenv(env_var)
+    if not model:
+        raise RuntimeError(f"Missing {env_var} for Google models{hint}")
+    return model
 
 
 @register_llm("google")
@@ -34,7 +41,11 @@ def build_google_llm(
     **kwargs,
 ) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
-        model=model or os.getenv("CHAT_MODEL", DEFAULT_CHAT_MODEL),
+        model=_resolve_model(
+            model,
+            "CHAT_MODEL",
+            " (or INTENT_CHAT_MODEL when Google only classifies intent)",
+        ),
         google_api_key=_resolve_api_key(api_key),
         temperature=temperature,
         **kwargs,
@@ -49,7 +60,7 @@ def build_google_embeddings(
     **kwargs,
 ) -> GoogleGenerativeAIEmbeddings:
     return GoogleGenerativeAIEmbeddings(
-        model=model or os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
+        model=_resolve_model(model, "EMBEDDING_MODEL"),
         google_api_key=_resolve_api_key(api_key),
         **kwargs,
     )

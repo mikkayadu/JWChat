@@ -100,7 +100,7 @@ ENGLISH = Language(
         ),
         out_of_domain=(
             "I can only answer from indexed Jehovah's Witnesses sources. "
-            "Please ask a JW-related question so I can cite the relevant material."
+            "Please ask a scriptural question so I can cite the relevant material."
         ),
         unavailable=(
             "The AI model is currently unavailable, so I can't process your question right "

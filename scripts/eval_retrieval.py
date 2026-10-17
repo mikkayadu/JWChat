@@ -108,7 +108,7 @@ def run_retrieval(items: list[dict], lang: languages.Language, k: int, fetch_k: 
 
     embeddings = ModelFactory.create_embeddings(
         os.getenv("EMBEDDINGS_PROVIDER", "google"),
-        model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
+        model=os.getenv("EMBEDDING_MODEL"),
         target_dim=int(os.getenv("EMBEDDING_DIMENSIONS", "0") or 0),
     )
     index = Pinecone(api_key=os.environ["PINECONE_API_KEY"]).Index(
